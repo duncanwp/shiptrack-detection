@@ -1,0 +1,5 @@
+# Requirements
+numpy
+keras
+tensorflow
+segmentation-models
