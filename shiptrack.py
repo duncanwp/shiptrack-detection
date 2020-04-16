@@ -96,7 +96,7 @@ if __name__ == '__main__':
     channel = args.channel
 
     all_data = np.load(os.path.join(training_dir, '{}_image_cache.npy'.format(dataset)))
-    all_labels = np.load(os.path.join(training_dir, 'point_{}_cache.npy'.format(dataset)))
+    all_labels = np.load(os.path.join(training_dir, 'new_point_{}_cache.npz'.format(dataset)))['arr_0']
 
     scaled_data = all_data.astype('float32') / 255.
     if channel is not None:
