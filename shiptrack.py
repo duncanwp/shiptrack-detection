@@ -66,7 +66,6 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('dataset', help="The dataset to train against")
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--batch-size', type=int, default=128)
@@ -74,7 +73,7 @@ if __name__ == '__main__':
     parser.add_argument('--model-dir', type=str, default=os.environ['SM_MODEL_DIR'])
     parser.add_argument('--tensorboard-dir', type=str, default=os.environ.get('SM_MODULE_DIR'))
     parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
-    parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
+#     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
     parser.add_argument('--channel', type=int, default=None)
     parser.add_argument('--augment', action='store_true')
     parser.add_argument('--encoder-freeze', action='store_true')
@@ -91,12 +90,11 @@ if __name__ == '__main__':
     gpu_count = args.gpu_count
     model_dir = args.model_dir
     training_dir = args.training
-    validation_dir = args.validation
-    dataset = args.dataset
+#     validation_dir = args.validation
     channel = args.channel
 
-    all_data = np.load(os.path.join(training_dir, '{}_image_cache.npy'.format(dataset)))
-    all_labels = np.load(os.path.join(training_dir, 'new_point_{}_cache.npz'.format(dataset)))['arr_0']
+    all_data = np.load(os.path.join(training_dir, 'data.npy'))
+    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
     scaled_data = all_data.astype('float32') / 255.
     if channel is not None:
