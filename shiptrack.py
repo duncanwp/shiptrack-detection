@@ -79,7 +79,7 @@ if __name__ == '__main__':
     parser.add_argument('--encoder-freeze', action='store_true')
     parser.add_argument('--backbone', default='resnet152')
 
-    parser.add_argument('--test-prop', type=int, default=20,
+    parser.add_argument('--test-prop', type=int, default=10,
                         help="Percentage of images to use for testing")
 
     args, _ = parser.parse_known_args()
@@ -93,7 +93,7 @@ if __name__ == '__main__':
 #     validation_dir = args.validation
     channel = args.channel
 
-    all_data = np.load(os.path.join(training_dir, 'data.npy'))
+    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
     all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
     scaled_data = all_data.astype('float32') / 255.
@@ -111,9 +111,9 @@ if __name__ == '__main__':
     # data_norm = (padded_data - padded_data.mean(axis=0)) / padded_data.std(axis=0)
     data_norm = padded_data
 
-    n_test = (data_norm // args.val_prop) * 100
-    x_test, y_test = data_norm[:n_test], padded_labels[:n_test]
-    x_train, y_train = data_norm[n_test:], padded_labels[n_test:]
+    n_test = (data_norm.shape[0] // 100) * args.test_prop
+    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
+    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
 
     print(x_train.shape[0], 'train/val samples')
     print(x_test.shape[0], 'test samples')
@@ -142,8 +142,8 @@ if __name__ == '__main__':
                         epochs=epochs, augment=False)
 
     score = model.evaluate(x_test, y_test, verbose=0)
-    print('Validation loss    :', score[0])
-    print('Validation accuracy:', score[1])
+    print('Test loss    :', score[0])
+    print('Test accuracy:', score[1])
 
     # save Keras model for Tensorflow Serving
     sess = K.get_session()
