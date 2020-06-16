@@ -12,6 +12,10 @@ from segmentation_models import get_preprocessing
 from segmentation_models.losses import *
 from segmentation_models.metrics import iou_score
 
+# Tensorflow needs image channels last, e.g. (batch size, width, height, channels)
+K.set_image_data_format('channels_last')
+print(K.image_data_format())
+
 losses = {'jaccard_loss': jaccard_loss,
           'dice_loss': dice_loss,
           'binary_focal_loss': binary_focal_loss,
@@ -20,11 +24,6 @@ losses = {'jaccard_loss': jaccard_loss,
           'bce_jaccard_loss': bce_jaccard_loss,
           'binary_focal_dice_loss': binary_focal_dice_loss,
           'binary_focal_jaccard_loss': binary_focal_jaccard_loss}
-
-def random_pad(vec, pad_width, *_, **__):
-    print(vec.shape)
-    vec[:pad_width[0]] = np.random.uniform(size=pad_width[0])
-    vec[vec.size - pad_width[1]:] = np.random.uniform(size=pad_width[1])
 
 
 def get_data_flow(data, labels, subset, batch_size=1):
@@ -79,8 +78,74 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
-        
-        
+
+
+def main(training_dir, epochs, lr, batch_size, gpu_count, model_dir, channel,
+         backbone, augment, loss, encoder_freeze, test_prop):
+
+    x_test, x_train, y_test, y_train = get_data(training_dir, test_prop, channel)
+
+    # preprocess input
+    preprocess_input = get_preprocessing(backbone)
+    x_train = preprocess_input(x_train)
+
+    # define model
+    model = Unet(backbone, encoder_weights='imagenet', encoder_freeze=encoder_freeze, classes=1,
+                 activation='sigmoid')
+
+    if gpu_count > 1:
+        model = multi_gpu_model(model, gpus=gpu_count)
+    print(model.summary())
+
+    model.compile(Adam(lr=lr), loss=losses[loss], metrics=[iou_score])
+
+    history = fit_model(model, x_train, y_train, batch_size=batch_size, n_gpus=gpu_count,
+                        epochs=epochs, augment=augment)
+
+    score = model.evaluate(x_test, y_test, verbose=0)
+
+    print('Test loss    :', score[0])
+    print('Test accuracy:', score[1])
+
+    # save Keras model for Tensorflow Serving
+    sess = K.get_session()
+    tf.saved_model.simple_save(
+        sess,
+        os.path.join(model_dir, 'model/1'),
+        inputs={'inputs': model.input},
+        outputs={t.name: t for t in model.outputs})
+
+
+def get_data(training_dir, test_prop, channel=None):
+    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
+    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
+
+    scaled_data = all_data.astype('float32') / 255.
+    if channel is not None:
+        scaled_data = scaled_data[..., channel]
+    else:
+        # Drop the alpha
+        scaled_data = scaled_data[..., :3]
+
+    padded_data = np.pad(scaled_data, ((0, 0), (4, 4), (4, 4), (0, 0)), mode='mean')
+    # Pads with zeros by default
+    padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
+
+    # Normalise the data, we can use a constant mean and std calculated across all the imagery
+    #     This shouldn't be needed for sigmoid activation
+    #     data_norm = (padded_data - 0.45) / 0.25
+    data_norm = padded_data
+
+    n_test = (data_norm.shape[0] // 100) * test_prop
+    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
+    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
+
+    print(x_train.shape[0], 'train/val samples')
+    print(x_test.shape[0], 'test samples')
+
+    return x_test, x_train, y_test, y_train
+
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -105,74 +170,6 @@ if __name__ == '__main__':
     parser.add_argument('--test-prop', type=int, default=10,
                         help="Percentage of images to use for testing")
 
-    args, _ = parser.parse_known_args()
+    args = vars(parser.parse_args())
 
-    epochs = args.epochs
-    lr = args.learning_rate
-    batch_size = args.batch_size
-    gpu_count = args.gpu_count
-    model_dir = args.model_dir
-    training_dir = args.training
-#     validation_dir = args.validation
-    channel = args.channel
-
-    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
-    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
-
-    scaled_data = all_data.astype('float32') / 255.
-    if channel is not None:
-        scaled_data = scaled_data[..., channel]
-    else:
-        # Drop the alpha
-        scaled_data = scaled_data[..., :3]
-
-    padded_data = np.pad(scaled_data, ((0, 0), (4, 4), (4, 4), (0, 0)), mode='mean')
-    # Pads with zeros by default
-    padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
-
-    # Normalise the data, we can use a constant mean and std calculated across all the imagery
-#     This shouldn't be needed for sigmoid activation
-#     data_norm = (padded_data - 0.45) / 0.25
-    data_norm = padded_data
-
-    n_test = (data_norm.shape[0] // 100) * args.test_prop
-    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
-    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
-
-    print(x_train.shape[0], 'train/val samples')
-    print(x_test.shape[0], 'test samples')
-
-    # input image dimensions
-    img_rows, img_cols = 448, 448
-
-    # Tensorflow needs image channels last, e.g. (batch size, width, height, channels)
-    K.set_image_data_format('channels_last')
-    print(K.image_data_format())
-
-    # preprocess input
-    preprocess_input = get_preprocessing(args.backbone)
-    x_train = preprocess_input(x_train)
-
-    # define model
-    model = Unet(args.backbone, encoder_weights='imagenet', encoder_freeze=args.encoder_freeze, classes=1, activation='sigmoid')
-    if gpu_count > 1:
-        model = multi_gpu_model(model, gpus=gpu_count)
-
-    print(model.summary())
-
-    model.compile(Adam(lr=lr), loss=losses[args.loss], metrics=[iou_score])
-
-    history = fit_model(model, x_train, y_train, batch_size=batch_size, n_gpus=gpu_count,
-                        epochs=epochs, augment=args.augment)
-
-    score = model.evaluate(x_test, y_test, verbose=0)
-    print('Test loss    :', score[0])
-    print('Test accuracy:', score[1])
-
-    # save Keras model for Tensorflow Serving
-    sess = K.get_session()
-    tf.saved_model.simple_save(
-        sess,
-        os.path.join(model_dir, 'model/1'),
-        inputs={'inputs': model.input},
-        outputs={t.name: t for t in model.outputs})
+    main(**args)
