@@ -9,9 +9,17 @@ from keras.utils import multi_gpu_model
 
 from segmentation_models import Unet
 from segmentation_models import get_preprocessing
-from segmentation_models.losses import bce_jaccard_loss
+from segmentation_models.losses import *
 from segmentation_models.metrics import iou_score
 
+losses = {'jaccard_loss': jaccard_loss,
+          'dice_loss': dice_loss,
+          'binary_focal_loss': binary_focal_loss,
+          'binary_crossentropy': binary_crossentropy,
+          'bce_dice_loss': bce_dice_loss,
+          'bce_jaccard_loss': bce_jaccard_loss,
+          'binary_focal_dice_loss': binary_focal_dice_loss,
+          'binary_focal_jaccard_loss': binary_focal_jaccard_loss}
 
 def random_pad(vec, pad_width, *_, **__):
     print(vec.shape)
@@ -38,7 +46,7 @@ def get_data_flow(data, labels, subset, batch_size=1):
 
 def fit_model(model, training_data, labels, batch_size=1, n_gpus=1, epochs=1, augment=True, tensorboard_dir=''):
 
-    tensorboard = TensorBoard(log_dir=tensorboard_dir, histogram_freq=0 if augment else 4,
+    tensorboard = TensorBoard(log_dir=tensorboard_dir, histogram_freq=0,
                               write_images=True, write_graph=False)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=5e-7, verbose=1)
 
@@ -62,6 +70,17 @@ def fit_model(model, training_data, labels, batch_size=1, n_gpus=1, epochs=1, au
     return history
 
 
+def str2bool(v):
+    if isinstance(v, bool):
+       return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+        
+        
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -75,10 +94,14 @@ if __name__ == '__main__':
     parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
 #     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
     parser.add_argument('--channel', type=int, default=None)
-    parser.add_argument('--augment', action='store_true')
-    parser.add_argument('--encoder-freeze', action='store_true')
+    parser.add_argument("--augment", type=str2bool, nargs='?',
+                            const=True, default=False,
+                            help="Augment the training data.")
+    parser.add_argument("--encoder-freeze", type=str2bool, nargs='?',
+                            const=True, default=False,
+                            help="Freeze the weights of the encoding layer.")
     parser.add_argument('--backbone', default='resnet152')
-
+    parser.add_argument('--loss', default='bce_jaccard_loss', choices=list(losses.keys()))
     parser.add_argument('--test-prop', type=int, default=10,
                         help="Percentage of images to use for testing")
 
@@ -98,7 +121,7 @@ if __name__ == '__main__':
 
     scaled_data = all_data.astype('float32') / 255.
     if channel is not None:
-        scaled_data = scaled_data[..., np.newaxis]
+        scaled_data = scaled_data[..., channel]
     else:
         # Drop the alpha
         scaled_data = scaled_data[..., :3]
@@ -107,8 +130,9 @@ if __name__ == '__main__':
     # Pads with zeros by default
     padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
 
-    # TODO: Does this help? Shouldn't I use a constant normalisation which I can then use for inference?
-    # data_norm = (padded_data - padded_data.mean(axis=0)) / padded_data.std(axis=0)
+    # Normalise the data, we can use a constant mean and std calculated across all the imagery
+#     This shouldn't be needed for sigmoid activation
+#     data_norm = (padded_data - 0.45) / 0.25
     data_norm = padded_data
 
     n_test = (data_norm.shape[0] // 100) * args.test_prop
@@ -130,16 +154,16 @@ if __name__ == '__main__':
     x_train = preprocess_input(x_train)
 
     # define model
-    model = Unet(args.backbone, encoder_weights='imagenet', encoder_freeze=args.encoder_freeze)
+    model = Unet(args.backbone, encoder_weights='imagenet', encoder_freeze=args.encoder_freeze, classes=1, activation='sigmoid')
     if gpu_count > 1:
         model = multi_gpu_model(model, gpus=gpu_count)
 
     print(model.summary())
 
-    model.compile(Adam(learning_rate=lr), loss=bce_jaccard_loss, metrics=[iou_score])
+    model.compile(Adam(lr=lr), loss=losses[args.loss], metrics=[iou_score])
 
     history = fit_model(model, x_train, y_train, batch_size=batch_size, n_gpus=gpu_count,
-                        epochs=epochs, augment=False)
+                        epochs=epochs, augment=args.augment)
 
     score = model.evaluate(x_test, y_test, verbose=0)
     print('Test loss    :', score[0])
