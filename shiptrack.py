@@ -33,7 +33,9 @@ def get_data_flow(data, labels, subset, batch_size=1):
         shear_range=0.2,
         zoom_range=0.2,
         horizontal_flip=True,
-        validation_split=0.2)
+        vertical_flip=True,
+        validation_split=0.2,
+        fill_mode='constant')
 
     generator = datagen.flow(
         data, y=labels,
@@ -80,10 +82,45 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def main(training_dir, epochs, lr, batch_size, gpu_count, model_dir, channel,
-         backbone, augment, loss, encoder_freeze, test_prop):
+def get_data(training_dir, test_prop, channel=None):
+    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
+    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
-    x_test, x_train, y_test, y_train = get_data(training_dir, test_prop, channel)
+    # If we have more than one class, collapse them all together (we're not trying different types)
+    if all_labels.shape[3] > 2:
+        all_labels[..., 1] = all_labels.any(axis=3).astype('uint8')
+        all_labels = all_labels[..., 0:2]
+    
+    scaled_data = all_data.astype('float32') / 255.
+    if channel is not None:
+        scaled_data = scaled_data[..., channel]
+    else:
+        # Drop the alpha
+        scaled_data = scaled_data[..., :3]
+
+    padded_data = np.pad(scaled_data, ((0, 0), (4, 4), (4, 4), (0, 0)), mode='mean')
+    # Pads with zeros by default
+    padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
+    
+    # Normalise the data, we can use a constant mean and std calculated across all the imagery
+    #     This shouldn't be needed for sigmoid activation
+#     data_norm = (padded_data - 0.55) / 0.15
+    data_norm = padded_data
+
+    n_test = (data_norm.shape[0] // 100) * test_prop
+    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
+    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
+
+    print(x_train.shape[0], 'train/val samples')
+    print(x_test.shape[0], 'test samples')
+
+    return x_test, x_train, y_test, y_train
+
+
+def main(training, epochs, learning_rate, batch_size, gpu_count, model_dir, channel,
+         backbone, augment, loss, encoder_freeze, test_prop, tensorboard_dir):
+
+    x_test, x_train, y_test, y_train = get_data(training, test_prop, channel)
 
     # preprocess input
     preprocess_input = get_preprocessing(backbone)
@@ -97,10 +134,10 @@ def main(training_dir, epochs, lr, batch_size, gpu_count, model_dir, channel,
         model = multi_gpu_model(model, gpus=gpu_count)
     print(model.summary())
 
-    model.compile(Adam(lr=lr), loss=losses[loss], metrics=[iou_score])
+    model.compile(Adam(lr=learning_rate), loss=losses[loss], metrics=[iou_score])
 
     history = fit_model(model, x_train, y_train, batch_size=batch_size, n_gpus=gpu_count,
-                        epochs=epochs, augment=augment)
+                        epochs=epochs, augment=augment, tensorboard_dir=tensorboard_dir)
 
     score = model.evaluate(x_test, y_test, verbose=0)
 
@@ -116,36 +153,6 @@ def main(training_dir, epochs, lr, batch_size, gpu_count, model_dir, channel,
         outputs={t.name: t for t in model.outputs})
 
 
-def get_data(training_dir, test_prop, channel=None):
-    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
-    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
-
-    scaled_data = all_data.astype('float32') / 255.
-    if channel is not None:
-        scaled_data = scaled_data[..., channel]
-    else:
-        # Drop the alpha
-        scaled_data = scaled_data[..., :3]
-
-    padded_data = np.pad(scaled_data, ((0, 0), (4, 4), (4, 4), (0, 0)), mode='mean')
-    # Pads with zeros by default
-    padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
-
-    # Normalise the data, we can use a constant mean and std calculated across all the imagery
-    #     This shouldn't be needed for sigmoid activation
-    #     data_norm = (padded_data - 0.45) / 0.25
-    data_norm = padded_data
-
-    n_test = (data_norm.shape[0] // 100) * test_prop
-    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
-    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
-
-    print(x_train.shape[0], 'train/val samples')
-    print(x_test.shape[0], 'test samples')
-
-    return x_test, x_train, y_test, y_train
-
-
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -154,7 +161,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--gpu-count', type=int, default=os.environ['SM_NUM_GPUS'])
-    parser.add_argument('--model-dir', type=str, default=os.environ['SM_MODEL_DIR'])
+    parser.add_argument('--model_dir', type=str, default=os.environ['SM_MODEL_DIR'])
     parser.add_argument('--tensorboard-dir', type=str, default=os.environ.get('SM_MODULE_DIR'))
     parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
 #     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
