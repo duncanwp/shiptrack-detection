@@ -4,14 +4,12 @@ Run inference over a (possibly remote) dataset using a saved tf model
 """
 import tensorflow as tf
 import numpy as np
+import argparse
+import matplotlib.pyplot as plt
+
 # normalise = lambda data: [(d - mean_data)/std_data for d in data]
 # normalise = lambda data: (data - 0.5)/0.25
 normalise = lambda data: [(d - 0.45)/0.25 for d in data]
-
-# tf_predictor = tf.keras.models.load_model('model/1/')
-tf_predictor = tf.saved_model.load('model/1/')
-# Check its architecture
-#tf_predictor.summary()
 
 
 def split_array(arr, step_size=440):
@@ -22,16 +20,10 @@ def split_array(arr, step_size=440):
     return sum((np.array_split(v_split, y_split_locs, axis=1) for v_split in v_splits), [])
 
 
-def process_typed_file(f_key, image_size, path=None, resize=False, channel=None):
-    import boto3
+def process_typed_file(file, image_size, resize=False, channel=None):
     from PIL import ImageOps, Image
-    from io import BytesIO
 
-
-    s3 = boto3.client('s3')
-    file_byte_string = s3.get_object(Bucket='imiracli-data', Key=f_key)['Body'].read()
-
-    im_data = Image.open(BytesIO(file_byte_string))
+    im_data = Image.open(file)
     if (im_data.size[1] not in [2030, 2040]) or (im_data.size[0] != 1354):
         print("Skipping wierd shape: {}".format(im_data.size))
         raise ValueError()
@@ -56,6 +48,8 @@ def process_typed_file(f_key, image_size, path=None, resize=False, channel=None)
 
 
 def combine_and_resize_masks(masks, original_size):
+    from PIL import Image
+
     print(masks.shape)
     # TODO: Make the nesting a parameter
     nested_masks = [np.split(m, 5) for m in np.split(masks[..., 0], 8, 0)]
@@ -78,44 +72,56 @@ def combine_and_resize_masks(masks, original_size):
 
 def get_ship_track_mask(f):
     data, original_shape = process_typed_file(f, (448*4, 448*3), resize=True)
-    norm_data = normalise(data)
+    # norm_data = normalise(data)
     print(original_shape)
     print(data.shape)
 
-    split_data = normalise(split_array(np.concatenate([data[..., 0:1]/255.]*3, axis=-1), 448))
-    # Normalise? Anythinf else?
-#     print(split_data[0].shape)
-    stacked_data = np.stack(split_data)
-    print(stacked_data.shape)
+    # split_data = normalise(split_array(np.concatenate([data[..., 0:1]/255.]*3, axis=-1), 448))
+    split_data = split_array(np.concatenate([data[..., 0:1] / 255.] * 3, axis=-1), 448)
 
-    pred = tf_predictor.predict(stacked_data[0:1,...].tolist())
-    print(pred)
-    prediction = np.array(pred['predictions'])
-    
-#     for p in prediction:
-#         fig, axs = plt.subplots(figsize=(10, 20))
-#         axs.imshow(data[..., 0])
-#         axs.imshow(p[:,:, 0], alpha=0.5)
-#         plt.show()
-#     print(prediction.any())
-#     print(prediction.shape)
+    prediction = tf_predictor.predict(x=np.stack(split_data))
+
     combined_prediction = combine_and_resize_masks(prediction, original_shape)
     
+    # Test the recombination is working correctly
     combined_data = combine_and_resize_masks(np.stack(split_data), original_shape)
-    
-#     print(combined_data.shape)
-#     print(combined_prediction.any())
-#     print(combined_prediction)
-    if combined_prediction.any():
-        fig, axs = plt.subplots(figsize=(20, 40))
-        axs.imshow(combined_data[...], vmin=-2, vmax=2)
-        im=axs.imshow(combined_prediction[:,:], alpha=0.5, vmin=0, vmax=1)
-#         plt.colorbar(im)
-        plt.show()
-    return combined_prediction
+    assert combined_data == data
+
+    return data, combined_prediction
 
 
-data_path = 's3://imiracli-data/MODIS_deep_cloud/test_niremi_inference_images/' 
-file_path = data_path+"images/MYD021KM.A2006166.1845.061.2018022234106.png"
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
 
-arr = get_ship_track_mask("MODIS_deep_cloud/test_niremi_inference_images/images/MYD021KM.A2006166.1845.061.2018022234106.png")
+    parser.add_argument('model', help="The model directory to use")
+    parser.add_argument('infiles', nargs='*')
+    parser.add_argument('--infile', help="Input file", type=argparse.FileType('r'))
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('-o', '--outfile', help="Output name")
+
+    args = parser.parse_args()
+
+    # tf_predictor = tf.keras.models.load_model('model/1/')
+    tf_predictor = tf.saved_model.load(args.model+'/1/')
+    # Check its architecture
+    # tf_predictor.summary()
+
+    if args.infile is not None:
+        print("Reading filelist from {}".format(args.infile))
+        infiles = args.infile.readlines()
+    else:
+        infiles = args.infiles
+
+    for f in infiles:
+        data, mask = get_ship_track_mask(f)
+
+    #     print(combined_data.shape)
+    #     print(combined_prediction.any())
+    #     print(combined_prediction)
+        if args.show and mask.any():
+            fig, axs = plt.subplots(figsize=(20, 40))
+            axs.imshow(data[...], vmin=-2, vmax=2)
+            im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
+    #         plt.colorbar(im)
+            plt.show()
+        np.savez_compressed(f"{f}_{args.outfile}.png")
