@@ -2,6 +2,9 @@
 """
 Run inference over a (possibly remote) dataset using a saved tf model
 """
+import matplotlib
+matplotlib.use('agg')
+
 import tensorflow as tf
 import numpy as np
 import argparse
@@ -38,8 +41,8 @@ def process_typed_file(file, image_size, resize=False, channel=None):
         padding = 85 if im_data.size[1] == 2030 else 80
         im_data = ImageOps.expand(im_data, padding)
 
-    # Drop the end of the y axis
-    im_data = np.array(im_data)#[:, :1320, :]
+    # Drop the alpha channel
+    im_data = np.array(im_data)[:, :, 0:3]
     
     if channel is not None:
         im_data = im_data[..., channel]
@@ -47,47 +50,71 @@ def process_typed_file(file, image_size, resize=False, channel=None):
     return im_data, original_shape
 
 
+def resize(arr, target_size, bilinear=False):
+    from PIL import Image
+    
+    resampler = Image.BILINEAR if bilinear else Image.NEAREST
+    
+    arr_im = Image.fromarray(arr)
+
+    arr_im = arr_im.resize(target_size, resample=resampler)
+    
+    new_arr = np.array(arr_im)
+    return new_arr
+
 def combine_and_resize_masks(masks, original_size):
     from PIL import Image
 
-    print(masks.shape)
+    #print(masks.shape)
     # TODO: Make the nesting a parameter
-    nested_masks = [np.split(m, 5) for m in np.split(masks[..., 0], 8, 0)]
+    nested_masks = [np.split(m, 4) for m in np.split(masks[..., 0], 3, 0)]
 #     print(len(nested_masks))
 #     print(nested_masks[0][0].shape)
 #     nested_masks = np.reshape(masks, (5, 8))
+    #print([m.shape for m in nested_masks])
     
     mask = np.squeeze(np.block(nested_masks))
-#     print(mask.shape)
-    print(mask.any())
-    mask_im = Image.fromarray(mask)
+    #print(mask.shape)
+    #print(mask.any())
 
-    mask_im = mask_im.resize(original_size, resample=Image.NEAREST)
-
-    # Don't forget to pop off the superfluous color dimension
-    new_mask = np.array(mask_im)#[:, :, 0]
+    new_mask = resize(mask, original_size)
     
     return new_mask
 
 
 def get_ship_track_mask(f):
-    data, original_shape = process_typed_file(f, (448*4, 448*3), resize=True)
+    data, original_size = process_typed_file(f, (448*4, 448*3), resize=True)
+    #plt.imshow(data)
+    #plt.show()
     # norm_data = normalise(data)
-    print(original_shape)
-    print(data.shape)
+    print("Original size: " + str(original_size))
+    print("Re-shaped shape: " + str(data.shape))
 
     # split_data = normalise(split_array(np.concatenate([data[..., 0:1]/255.]*3, axis=-1), 448))
-    split_data = split_array(np.concatenate([data[..., 0:1] / 255.] * 3, axis=-1), 448)
+    split_data = split_array(data, 448)
 
-    prediction = tf_predictor.predict(x=np.stack(split_data))
+    prediction = tf_predictor(inputs=tf.constant(np.stack(split_data), dtype='float32'))
 
-    combined_prediction = combine_and_resize_masks(prediction, original_shape)
+    prediction = prediction['sigmoid_1/concat:0'] > 0.5
+
+    combined_prediction = combine_and_resize_masks(prediction, original_size)
+
+    #plt.imshow(combined_prediction)
+    #plt.show()
     
     # Test the recombination is working correctly
-    combined_data = combine_and_resize_masks(np.stack(split_data), original_shape)
-    assert combined_data == data
+    #combined_data = combine_and_resize_masks(np.stack(split_data), original_size)
+    #print("Testing data combination:")
+    #print("Recombined shape: " + str(combined_data.shape))
 
-    return data, combined_prediction
+    #plt.imshow(combined_data)
+    #plt.show()
+    #print("Reshaped data: " + str(data[100,100,0]))
+    #print("Recomnbined data: " + str(combined_data[100,100]))
+
+    original_size_data = resize(data, original_size, bilinear=True)
+
+    return original_size_data, combined_prediction
 
 
 if __name__ == '__main__':
@@ -97,12 +124,14 @@ if __name__ == '__main__':
     parser.add_argument('infiles', nargs='*')
     parser.add_argument('--infile', help="Input file", type=argparse.FileType('r'))
     parser.add_argument('--show', action='store_true')
-    parser.add_argument('-o', '--outfile', help="Output name")
+    parser.add_argument('-o', '--outfile', help="Output name", default='mask')
 
     args = parser.parse_args()
 
-    # tf_predictor = tf.keras.models.load_model('model/1/')
-    tf_predictor = tf.saved_model.load(args.model+'/1/')
+    # tf_predictor = tf.keras.models.load_model(args.model+'/1/')
+    model = tf.saved_model.load(args.model+'/1/')
+    tf_predictor = model.signatures["serving_default"]
+    print(tf_predictor)
     # Check its architecture
     # tf_predictor.summary()
 
@@ -115,13 +144,16 @@ if __name__ == '__main__':
     for f in infiles:
         data, mask = get_ship_track_mask(f)
 
-    #     print(combined_data.shape)
-    #     print(combined_prediction.any())
-    #     print(combined_prediction)
-        if args.show and mask.any():
-            fig, axs = plt.subplots(figsize=(20, 40))
-            axs.imshow(data[...], vmin=-2, vmax=2)
-            im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
-    #         plt.colorbar(im)
-            plt.show()
-        np.savez_compressed(f"{f}_{args.outfile}.png")
+        print(data.shape)
+        print(mask.any())
+        print(mask.shape)
+        if mask.any():
+            if args.show:
+                fig, axs = plt.subplots(figsize=(20, 40))
+                axs.imshow(data, vmin=0., vmax=1.)
+                im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
+        #         plt.colorbar(im)
+                plt.savefig(f"{f[:-4]}_{args.outfile}.png")
+            np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
+        else:
+            print(f"No shiptracks found in {f}")
