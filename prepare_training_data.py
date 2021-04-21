@@ -96,9 +96,9 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('track-file')
-    parser.add_argument('output-path')
-    parser.add_argument('experiment-name')
+    parser.add_argument('track_file', metavar='track-file')
+    parser.add_argument('output_path', metavar='output-path')
+    parser.add_argument('experiment_name', metavar='experiment-name')
     parser.add_argument('--modis-path', type=str,
                         default='/group_workspaces/cems2/nceo_generic/satellite_data/modis_c61/')
 
