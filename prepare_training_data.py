@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 Create training images, labels and segmentation annotations given a set of shiptrack locations
 """
@@ -50,8 +51,9 @@ def main(track_file, output_path, experiment_name, modis_path):
                 print('exists: ' + image_file)
                 img = PIL.open(image_file)
             else:
-                global_scene = (Scene(reader="hdfeos_l1b", filenames=file02 + file03))
-                global_scene.load(['1', '20', '32'], resolution=1000)
+                global_scene = (Scene(reader="modis_l1b", filenames=file02 + file03))
+                global_scene.load(['1', '32'], resolution=1000)
+                global_scene.load([DatasetID(name='20', modifiers=('nir_emissive',))])
                 compositor = GenericCompositor("rgb")
                 composite = compositor([global_scene['1'], global_scene['32'], global_scene['20']])
                 img = to_image(composite)
