@@ -1,11 +1,17 @@
 import argparse, os
 import numpy as np
+from pathlib import Path
 
 import tensorflow as tf
+
 from keras import backend as K
 from keras.callbacks import TensorBoard, ReduceLROnPlateau
 from keras.optimizers import Adam
 from keras.utils import multi_gpu_model
+
+# c.f. https://github.com/qubvel/segmentation_models/issues/374
+import os
+os.environ["SM_FRAMEWORK"] = "tf.keras"
 
 from segmentation_models import Unet
 from segmentation_models import get_preprocessing
@@ -30,8 +36,6 @@ def get_data_flow(data, labels, subset, batch_size=1):
     # this is the augmentation configuration we will use for training
     from keras.preprocessing.image import ImageDataGenerator
     datagen = ImageDataGenerator(
-        shear_range=0.2,
-        zoom_range=0.2,
         horizontal_flip=True,
         vertical_flip=True,
         validation_split=0.2,
@@ -45,15 +49,15 @@ def get_data_flow(data, labels, subset, batch_size=1):
     return generator
 
 
-def fit_model(model, training_data, labels, batch_size=1, n_gpus=1, epochs=1, augment=True, tensorboard_dir=''):
+def fit_model(model, training_data, labels, batch_size=1, epochs=1, augment=True, tensorboard_dir=''):
 
     tensorboard = TensorBoard(log_dir=tensorboard_dir, histogram_freq=0,
                               write_images=True, write_graph=False)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=5e-7, verbose=1)
 
     if augment:
-        train_generator = get_data_flow(training_data, labels, batch_size=batch_size * n_gpus, subset='training')
-        validation_generator = get_data_flow(training_data, labels, batch_size=batch_size * n_gpus, subset='validation')
+        train_generator = get_data_flow(training_data, labels, subset='training')
+        validation_generator = get_data_flow(training_data, labels, ubset='validation')
 
         history = model.fit_generator(generator=train_generator,
                                       steps_per_epoch=len(train_generator),
@@ -64,9 +68,14 @@ def fit_model(model, training_data, labels, batch_size=1, n_gpus=1, epochs=1, au
                                       # use_multiprocessing=True, workers=8,
                                       verbose=1)
     else:
-        history = model.fit(x=training_data, y=labels, validation_split=0.181818, verbose=1,
-                            batch_size=batch_size * n_gpus, epochs=epochs,
-                            callbacks=[tensorboard, reduce_lr])
+        ds = tf.data.Dataset.from_tensor_slices((training_data, labels))
+        n_val = int(training_data.shape[0]*0.181818)
+        n_test = int(training_data.shape[0]) - n_val
+        print(n_val)
+        val_dataset = ds.take(n_val).batch(batch_size)
+        train_dataset = ds.skip(n_val).shuffle(n_test, reshuffle_each_iteration=True).batch(batch_size)
+        history = model.fit(train_dataset, validation_data=val_dataset, verbose=1,
+                            epochs=epochs, callbacks=[tensorboard, reduce_lr])
 
     return history
 
@@ -82,8 +91,16 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_data(training_dir, test_prop, channel=None):
-    all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
+def get_data(training_dir, test_prop, channel=None, downsample=False):
+    import os
+    
+    if os.path.isfile(os.path.join(training_dir, 'data.npz')):
+        all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
+    elif os.path.isfile(os.path.join(training_dir, 'data.npy')):
+        all_data = np.load(os.path.join(training_dir, 'data.npy'))
+    else:
+        raise ValueError("No training data found")
+        
     all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
     # If we have more than one class, collapse them all together (we're not trying different types)
@@ -106,6 +123,11 @@ def get_data(training_dir, test_prop, channel=None):
     #     This shouldn't be needed for sigmoid activation
 #     data_norm = (padded_data - 0.55) / 0.15
     data_norm = padded_data
+    
+    if downsample:
+        new_shape = [data_norm.shape[1]//2, data_norm.shape[2]//2]
+        data_norm = tf.image.resize(data_norm, new_shape, antialias=True).numpy()
+        padded_labels = tf.image.resize(padded_labels, new_shape, method='nearest').numpy()
 
     n_test = (data_norm.shape[0] // 100) * test_prop
     x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
@@ -117,26 +139,28 @@ def get_data(training_dir, test_prop, channel=None):
     return x_test, x_train, y_test, y_train
 
 
-def main(training, epochs, learning_rate, batch_size, gpu_count, model_dir, channel,
-         backbone, augment, loss, encoder_freeze, test_prop, tensorboard_dir):
+def main(training, epochs, learning_rate, batch_size, model_dir, channel,
+         backbone, augment, loss, encoder_freeze, test_prop, tensorboard_dir, downsample):
 
-    x_test, x_train, y_test, y_train = get_data(training, test_prop, channel)
+    x_test, x_train, y_test, y_train = get_data(training, test_prop, channel, downsample)
 
     # preprocess input
     preprocess_input = get_preprocessing(backbone)
     x_train = preprocess_input(x_train)
+    
+    # Automatically mirror training across all available GPUs
+    strategy = tf.distribute.MirroredStrategy()
+    with strategy.scope():
 
-    # define model
-    model = Unet(backbone, encoder_weights='imagenet', encoder_freeze=encoder_freeze, classes=1,
-                 activation='sigmoid')
+        # define model
+        model = Unet(backbone, encoder_weights='imagenet', encoder_freeze=encoder_freeze, classes=1,
+                     activation='sigmoid')
 
-    if gpu_count > 1:
-        model = multi_gpu_model(model, gpus=gpu_count)
-    print(model.summary())
+        print(model.summary())
 
-    model.compile(Adam(lr=learning_rate), loss=losses[loss], metrics=[iou_score])
+        model.compile(Adam(lr=learning_rate), loss=losses[loss], metrics=[iou_score])
 
-    history = fit_model(model, x_train, y_train, batch_size=batch_size, n_gpus=gpu_count,
+    history = fit_model(model, x_train, y_train, batch_size=batch_size,
                         epochs=epochs, augment=augment, tensorboard_dir=tensorboard_dir)
 
     score = model.evaluate(x_test, y_test, verbose=0)
@@ -145,12 +169,9 @@ def main(training, epochs, learning_rate, batch_size, gpu_count, model_dir, chan
     print('Test accuracy:', score[1])
 
     # save Keras model for Tensorflow Serving
-    sess = K.get_session()
-    tf.saved_model.simple_save(
-        sess,
-        os.path.join(model_dir, 'model/1'),
-        inputs={'inputs': model.input},
-        outputs={t.name: t for t in model.outputs})
+    tf.saved_model.save(
+        model,
+        os.path.join(model_dir, 'model/1'))
 
 
 if __name__ == '__main__':
@@ -160,9 +181,8 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--gpu-count', type=int, default=os.environ['SM_NUM_GPUS'])
     parser.add_argument('--model_dir', type=str, default=os.environ['SM_MODEL_DIR'])
-    parser.add_argument('--tensorboard-dir', type=str, default=os.environ.get('SM_MODULE_DIR'))
+    parser.add_argument('--tensorboard-dir', type=str, default=Path(os.environ.get('SM_MODULE_DIR')).parent.parent)
     parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
 #     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
     parser.add_argument('--channel', type=int, default=None)
@@ -176,6 +196,9 @@ if __name__ == '__main__':
     parser.add_argument('--loss', default='bce_jaccard_loss', choices=list(losses.keys()))
     parser.add_argument('--test-prop', type=int, default=10,
                         help="Percentage of images to use for testing")
+    parser.add_argument("--downsample", type=str2bool, nargs='?',
+                            const=True, default=False,
+                            help="Downsample the data to 2km resolution.")    
 
     args = vars(parser.parse_args())
 
