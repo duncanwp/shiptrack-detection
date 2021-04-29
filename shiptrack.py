@@ -32,50 +32,14 @@ losses = {'jaccard_loss': jaccard_loss,
           'binary_focal_jaccard_loss': binary_focal_jaccard_loss}
 
 
-def get_data_flow(data, labels, subset, batch_size=1):
-    # this is the augmentation configuration we will use for training
-    from keras.preprocessing.image import ImageDataGenerator
-    datagen = ImageDataGenerator(
-        horizontal_flip=True,
-        vertical_flip=True,
-        validation_split=0.2,
-        fill_mode='constant')
-
-    generator = datagen.flow(
-        data, y=labels,
-        batch_size=batch_size if subset == 'training' else 1,
-        subset=subset)
-
-    return generator
-
-
-def fit_model(model, training_data, labels, batch_size=1, epochs=1, augment=True, tensorboard_dir=''):
+def fit_model(model, train_dataset, val_dataset, epochs=1, tensorboard_dir=''):
 
     tensorboard = TensorBoard(log_dir=tensorboard_dir, histogram_freq=0,
                               write_images=True, write_graph=False)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=5e-7, verbose=1)
 
-    if augment:
-        train_generator = get_data_flow(training_data, labels, subset='training')
-        validation_generator = get_data_flow(training_data, labels, ubset='validation')
-
-        history = model.fit_generator(generator=train_generator,
-                                      steps_per_epoch=len(train_generator),
-                                      epochs=epochs,
-                                      validation_steps=1,
-                                      validation_data=validation_generator,
-                                      callbacks=[tensorboard, reduce_lr],
-                                      # use_multiprocessing=True, workers=8,
-                                      verbose=1)
-    else:
-        ds = tf.data.Dataset.from_tensor_slices((training_data, labels))
-        n_val = int(training_data.shape[0]*0.181818)
-        n_test = int(training_data.shape[0]) - n_val
-        print(n_val)
-        val_dataset = ds.take(n_val).batch(batch_size)
-        train_dataset = ds.skip(n_val).shuffle(n_test, reshuffle_each_iteration=True).batch(batch_size)
-        history = model.fit(train_dataset, validation_data=val_dataset, verbose=1,
-                            epochs=epochs, callbacks=[tensorboard, reduce_lr])
+    history = model.fit(train_dataset, validation_data=val_dataset, verbose=1,
+                        epochs=epochs, callbacks=[tensorboard, reduce_lr])
 
     return history
 
@@ -91,79 +55,167 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_data(training_dir, test_prop, channel=None, downsample=False):
+def load_numpy_arrays(training_dir):
     import os
-    
+
     if os.path.isfile(os.path.join(training_dir, 'data.npz')):
         all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
     elif os.path.isfile(os.path.join(training_dir, 'data.npy')):
         all_data = np.load(os.path.join(training_dir, 'data.npy'))
     else:
         raise ValueError("No training data found")
-        
+
     all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
     # If we have more than one class, collapse them all together (we're not trying different types)
     if all_labels.shape[3] > 2:
         all_labels[..., 1] = all_labels.any(axis=3).astype('uint8')
         all_labels = all_labels[..., 0:2]
-    
-    scaled_data = all_data.astype('float32') / 255.
-    if channel is not None:
-        scaled_data = scaled_data[..., channel]
+
+    # Shuffle the data in-place since the original training datasets are roughly ordered
+    # Set a fixed seed for reproducibility
+    R_SEED = 12345
+    rstate = np.random.RandomState(R_SEED)
+    rstate.shuffle(all_data)
+    rstate = np.random.RandomState(R_SEED)  # Be sure to shuffle the labels using the same seed
+    rstate.shuffle(all_labels)
+
+    return all_data, all_labels
+
+
+def resize_and_rescale(image, label):
+    image = tf.cast(image, tf.float32)
+
+    # Resize to the intermediate size (which might include a downscale)
+    image = tf.image.resize(image, INT_IMG_SIZE)
+    label = tf.image.resize(label, INT_IMG_SIZE, 'nearest')
+    image = (image / 255.0)
+
+    # Slice the images to the final size...
+    flat_patches = tf.image.extract_patches(images=image,
+                                            sizes=[1, IMG_SIZE, IMG_SIZE, 1],
+                                            strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
+                                            rates=[1, 1, 1, 1],
+                                            padding='VALID')
+    image = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 1])  # Stack them along the leading dim
+
+    # ...And the labels
+    flat_patches = tf.image.extract_patches(images=label,
+                                            sizes=[1, IMG_SIZE, IMG_SIZE, 1],
+                                            strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
+                                            rates=[1, 1, 1, 1],
+                                            padding='VALID')
+    label = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 1])  # Stack them along the leading dim
+
+    return image, label
+
+
+def augment_images(image_label, seed):
+    image, label = image_label
+    image, label = resize_and_rescale(image, label)
+    image = tf.image.resize_with_crop_or_pad(image, IMG_SIZE + IMG_SIZE//20, IMG_SIZE + IMG_SIZE//20)
+    label = tf.image.resize_with_crop_or_pad(label, IMG_SIZE + IMG_SIZE // 20, IMG_SIZE + IMG_SIZE // 20)
+    # Make a new seed
+    new_seed = tf.random.experimental.stateless_split(seed, num=1)[0, :]
+    # Random crop back to the original size
+    image = tf.image.stateless_random_crop(
+      image, size=[IMG_SIZE, IMG_SIZE, 3], seed=seed)
+    label = tf.image.stateless_random_crop(
+      label, size=[IMG_SIZE, IMG_SIZE, 3], seed=seed)
+    # Random brightness
+    image = tf.image.stateless_random_brightness(
+      image, max_delta=0.5, seed=new_seed)  # (not the label for this one)
+    # Random flip
+    image = tf.image.stateless_random_flip_left_right(
+      image, seed=new_seed)
+    label = tf.image.stateless_random_flip_up_down(
+      label, seed=new_seed)
+    image = tf.clip_by_value(image, 0, 1)
+    return image, label
+
+
+def get_data(training_dir, test_prop, batch_size, augment):
+
+    all_data, all_labels = load_numpy_arrays(training_dir)
+
+    n_test = (all_data.shape[0] // 100) * test_prop
+    n_val = int((all_data.shape[0]-n_test)*0.181818)  # Fixed validation proportion of ~15% of original dataset
+    n_test = all_data.shape[0]-n_test-n_val
+
+    x_test, x_val, x_train = np.split(all_data, [n_test, n_test+n_val])
+    y_test, y_val, y_train = np.split(all_labels, [n_test, n_test+n_val])
+
+    print(n_test, 'test samples')
+    print(n_val, 'val samples')
+    print(n_test, 'test samples')
+
+    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+    val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val))
+    train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+
+    if augment:
+        # Create counter and zip together with train dataset
+        counter = tf.data.experimental.Counter()
+        train_ds = tf.data.Dataset.zip((train_ds, (counter, counter)))
+        train_fn = augment_images
     else:
-        # Drop the alpha
-        scaled_data = scaled_data[..., :3]
+        train_fn = resize_and_rescale
 
-    padded_data = np.pad(scaled_data, ((0, 0), (4, 4), (4, 4), (0, 0)), mode='mean')
-    # Pads with zeros by default
-    padded_labels = np.pad(all_labels[..., 1:2], ((0, 0), (4, 4), (4, 4), (0, 0)), mode='constant')
-    
-    # Normalise the data, we can use a constant mean and std calculated across all the imagery
-    #     This shouldn't be needed for sigmoid activation
-#     data_norm = (padded_data - 0.55) / 0.15
-    data_norm = padded_data
-    
-    if downsample:
-        new_shape = [data_norm.shape[1]//2, data_norm.shape[2]//2]
-        data_norm = tf.image.resize(data_norm, new_shape, antialias=True).numpy()
-        padded_labels = tf.image.resize(padded_labels, new_shape, method='nearest').numpy()
+    # TODO: Apply this fn to each of the below datasets *after* the map so it applies on the individual slices
+    #   I don't think it's nans I need to worry about though and it's not clear how much of a problem it is so
+    #    it's not plumbed in yet
+    def no_missing_vals(x, y):
+        return not tf.manth.any(tf.math.is_nan(x))
 
-    n_test = (data_norm.shape[0] // 100) * test_prop
-    x_test, y_test = data_norm[:n_test, ...], padded_labels[:n_test, ...]
-    x_train, y_train = data_norm[n_test:, ...], padded_labels[n_test:, ...]
+    train_ds = (
+        train_ds
+            .shuffle(n_test)
+            .map(train_fn, num_parallel_calls=AUTOTUNE)
+            .batch(batch_size)
+            .prefetch(AUTOTUNE)
+    )
 
-    print(x_train.shape[0], 'train/val samples')
-    print(x_test.shape[0], 'test samples')
+    val_ds = (
+        val_ds
+            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
+            .batch(batch_size)
+            .prefetch(AUTOTUNE)
+    )
 
-    return x_test, x_train, y_test, y_train
+    test_ds = (
+        test_ds
+            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
+            .batch(batch_size)
+            .prefetch(AUTOTUNE)
+    )
+
+    return test_ds, val_ds, train_ds
 
 
-def main(training, epochs, learning_rate, batch_size, model_dir, channel,
-         backbone, augment, loss, encoder_freeze, test_prop, tensorboard_dir, downsample):
+def main(training, epochs, learning_rate, batch_size, model_dir,
+         backbone, augment, loss, encoder_freeze, test_prop, tensorboard_dir):
 
-    x_test, x_train, y_test, y_train = get_data(training, test_prop, channel, downsample)
+    test_ds, val_ds, train_ds = get_data(training, test_prop, batch_size, augment)
 
     # preprocess input
     preprocess_input = get_preprocessing(backbone)
-    x_train = preprocess_input(x_train)
+    train_ds = preprocess_input(train_ds[0])
     
     # Automatically mirror training across all available GPUs
     strategy = tf.distribute.MirroredStrategy()
     with strategy.scope():
 
         # define model
-        model = Unet(backbone, encoder_weights='imagenet', encoder_freeze=encoder_freeze, classes=1,
-                     activation='sigmoid')
+        model = Unet(backbone, encoder_weights='imagenet', encoder_freeze=encoder_freeze,
+                     classes=1, activation='sigmoid')
 
         print(model.summary())
 
         model.compile(Adam(lr=learning_rate), loss=losses[loss], metrics=[iou_score])
 
-    history = fit_model(model, x_train, y_train, batch_size=batch_size,
-                        epochs=epochs, augment=augment, tensorboard_dir=tensorboard_dir)
+    history = fit_model(model, train_ds, val_ds, epochs=epochs, tensorboard_dir=tensorboard_dir)
 
-    score = model.evaluate(x_test, y_test, verbose=0)
+    score = model.evaluate(test_ds, verbose=0)
 
     print('Test loss    :', score[0])
     print('Test accuracy:', score[1])
@@ -185,10 +237,12 @@ if __name__ == '__main__':
     parser.add_argument('--tensorboard-dir', type=str, default=Path(os.environ.get('SM_MODULE_DIR')).parent.parent)
     parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
 #     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
-    parser.add_argument('--channel', type=int, default=None)
     parser.add_argument("--augment", type=str2bool, nargs='?',
                             const=True, default=False,
                             help="Augment the training data.")
+    parser.add_argument("--autotune", type=str2bool, nargs='?',
+                            const=True, default=False,
+                            help="Allow tf to autotune parallel processing.")
     parser.add_argument("--encoder-freeze", type=str2bool, nargs='?',
                             const=True, default=False,
                             help="Freeze the weights of the encoding layer.")
@@ -196,10 +250,18 @@ if __name__ == '__main__':
     parser.add_argument('--loss', default='bce_jaccard_loss', choices=list(losses.keys()))
     parser.add_argument('--test-prop', type=int, default=10,
                         help="Percentage of images to use for testing")
-    parser.add_argument("--downsample", type=str2bool, nargs='?',
-                            const=True, default=False,
-                            help="Downsample the data to 2km resolution.")    
+    parser.add_argument('--image-size', type=int, default=448,
+                        help="Image size (in pixels) for training")
+    parser.add_argument('--intermediate-image-size', nargs=2, default=(2240, 1344),
+                        help="Intermediate image size (in pixels) before slicing to final image-size. "
+                             "Can include a downsample. The default (2240, 1344) corresponds to an approximately "
+                             "5x3 image split for a final size of 448px")
 
     args = vars(parser.parse_args())
+
+    # These need to be global because the tf.Dataset.map used for pp above doesn't accept kwargs
+    IMG_SIZE = args.pop('image_size')
+    INT_IMG_SIZE = args.pop('intermediate-image_size')
+    AUTOTUNE = args.pop('autotune')
 
     main(**args)
