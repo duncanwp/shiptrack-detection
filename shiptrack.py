@@ -67,10 +67,14 @@ def load_numpy_arrays(training_dir):
 
     all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
 
+    # Drop the alpha
+    if all_data.shape[3] == 4:
+        all_data = all_data[..., :3]
+
     # If we have more than one class, collapse them all together (we're not trying different types)
-    if all_labels.shape[3] > 2:
-        all_labels[..., 1] = all_labels.any(axis=3).astype('uint8')
-        all_labels = all_labels[..., 0:2]
+    #if all_labels.shape[3] > 2:
+    #    all_labels[..., 1] = all_labels.any(axis=3).astype('uint8')
+    #    all_labels = all_labels[..., 0:2]
 
     # Shuffle the data in-place since the original training datasets are roughly ordered
     # Set a fixed seed for reproducibility
@@ -82,30 +86,47 @@ def load_numpy_arrays(training_dir):
 
     return all_data, all_labels
 
+def get_generator(all_data, all_labels):
+
+    for data, labels in zip(all_data, all_labels):
+        print(data)
+        # Resize the data
+        _data = tf.image.resize(data, INT_IMG_SIZE) / 255.
+        _labels = tf.squeeze(tf.image.resize(tf.expand_dims(labels, -1), INT_IMG_SIZE, 'nearest')) # Adding an extra color dim for tf.image
+        print(_data)
+        print(_labels)
+
+        # Slice the images to the final size...
+        flat_patches = tf.image.extract_patches(images=_data,
+                                                sizes=[1, IMG_SIZE, IMG_SIZE, 3],
+                                                strides=[1, IMG_SIZE, IMG_SIZE, 3],  # This should be the same as sizes
+                                                rates=[1, 1, 1, 1],
+                                                padding='VALID')
+        _data = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 3])  # Stack them along the leading dim
+
+        # ...And the labels
+        flat_patches = tf.image.extract_patches(images=_labels,
+                                                sizes=[1, IMG_SIZE, IMG_SIZE],
+                                                strides=[1, IMG_SIZE, IMG_SIZE],  # This should be the same as sizes
+                                                rates=[1, 1, 1],
+                                                padding='VALID')
+        _labels = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE])  # Stack them along the leading dim
+        print("done slicing")
+
+        has_labels = (tf.reshape(_labels, [-1, IMG_SIZE*IMG_SIZE]) > 0).any(1)
+        print(has_labels)
+        _data = tf.boolean_mask(_data, has_labels)
+        _labels = tf.boolean_mask(_labels, has_labels)
+        yield _data, _labels
+
 
 def resize_and_rescale(image, label):
     image = tf.cast(image, tf.float32)
 
     # Resize to the intermediate size (which might include a downscale)
     image = tf.image.resize(image, INT_IMG_SIZE)
-    label = tf.image.resize(label, INT_IMG_SIZE, 'nearest')
+    label = tf.squeeze(tf.image.resize(tf.expand_dims(label, -1), INT_IMG_SIZE, 'nearest')) # Adding an extra color dim for tf.image
     image = (image / 255.0)
-
-    # Slice the images to the final size...
-    flat_patches = tf.image.extract_patches(images=image,
-                                            sizes=[1, IMG_SIZE, IMG_SIZE, 1],
-                                            strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
-                                            rates=[1, 1, 1, 1],
-                                            padding='VALID')
-    image = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 1])  # Stack them along the leading dim
-
-    # ...And the labels
-    flat_patches = tf.image.extract_patches(images=label,
-                                            sizes=[1, IMG_SIZE, IMG_SIZE, 1],
-                                            strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
-                                            rates=[1, 1, 1, 1],
-                                            padding='VALID')
-    label = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 1])  # Stack them along the leading dim
 
     return image, label
 
@@ -121,7 +142,7 @@ def augment_images(image_label, seed):
     image = tf.image.stateless_random_crop(
       image, size=[IMG_SIZE, IMG_SIZE, 3], seed=seed)
     label = tf.image.stateless_random_crop(
-      label, size=[IMG_SIZE, IMG_SIZE, 3], seed=seed)
+      label, size=[IMG_SIZE, IMG_SIZE], seed=seed)
     # Random brightness
     image = tf.image.stateless_random_brightness(
       image, max_delta=0.5, seed=new_seed)  # (not the label for this one)
@@ -140,26 +161,29 @@ def get_data(training_dir, test_prop, batch_size, augment):
 
     n_test = (all_data.shape[0] // 100) * test_prop
     n_val = int((all_data.shape[0]-n_test)*0.181818)  # Fixed validation proportion of ~15% of original dataset
-    n_test = all_data.shape[0]-n_test-n_val
+    n_train = all_data.shape[0]-n_test-n_val
 
     x_test, x_val, x_train = np.split(all_data, [n_test, n_test+n_val])
     y_test, y_val, y_train = np.split(all_labels, [n_test, n_test+n_val])
 
     print(n_test, 'test samples')
     print(n_val, 'val samples')
-    print(n_test, 'test samples')
+    print(n_train, 'train samples')
 
-    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test))
-    val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val))
-    train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    sig = output_signature=(
+         tf.TensorSpec(shape=(None, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float64),
+         tf.TensorSpec(shape=(None, IMG_SIZE, IMG_SIZE), dtype=tf.int32))
+    test_ds = tf.data.Dataset.from_generator(get_generator, args=(x_test, y_test), output_signature=sig)
+    val_ds = tf.data.Dataset.from_generator(get_generator, args=(x_val, y_val), output_signature=sig)
+    train_ds = tf.data.Dataset.from_generator(get_generator, args=(x_train, y_train), output_signature=sig)
 
     if augment:
         # Create counter and zip together with train dataset
         counter = tf.data.experimental.Counter()
-        train_ds = tf.data.Dataset.zip((train_ds, (counter, counter)))
-        train_fn = augment_images
-    else:
-        train_fn = resize_and_rescale
+        train_ds = tf.data.Dataset.zip((train_ds, (counter, counter))).map(augment_images, num_parallel_calls=AUTOTUNE)
+#        train_fn = augment_images
+#    else:
+#        train_fn = resize_and_rescale
 
     # TODO: Apply this fn to each of the below datasets *after* the map so it applies on the individual slices
     #   I don't think it's nans I need to worry about though and it's not clear how much of a problem it is so
@@ -169,22 +193,22 @@ def get_data(training_dir, test_prop, batch_size, augment):
 
     train_ds = (
         train_ds
-            .shuffle(n_test)
-            .map(train_fn, num_parallel_calls=AUTOTUNE)
+            .shuffle(10)
+#            .map(train_fn, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
             .prefetch(AUTOTUNE)
     )
 
     val_ds = (
         val_ds
-            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
+#            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
             .prefetch(AUTOTUNE)
     )
 
     test_ds = (
         test_ds
-            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
+#            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
             .prefetch(AUTOTUNE)
     )
@@ -197,9 +221,13 @@ def main(training, epochs, learning_rate, batch_size, model_dir,
 
     test_ds, val_ds, train_ds = get_data(training, test_prop, batch_size, augment)
 
+    print("got data")
+
     # preprocess input
     preprocess_input = get_preprocessing(backbone)
     train_ds = preprocess_input(train_ds[0])
+
+    print("processed input")
     
     # Automatically mirror training across all available GPUs
     strategy = tf.distribute.MirroredStrategy()
@@ -240,9 +268,9 @@ if __name__ == '__main__':
     parser.add_argument("--augment", type=str2bool, nargs='?',
                             const=True, default=False,
                             help="Augment the training data.")
-    parser.add_argument("--autotune", type=str2bool, nargs='?',
-                            const=True, default=False,
-                            help="Allow tf to autotune parallel processing.")
+#    parser.add_argument("--autotune", type=str2bool, nargs='?',
+#                            const=True, default=False,
+#                            help="Allow tf to autotune parallel processing.")
     parser.add_argument("--encoder-freeze", type=str2bool, nargs='?',
                             const=True, default=False,
                             help="Freeze the weights of the encoding layer.")
@@ -261,7 +289,7 @@ if __name__ == '__main__':
 
     # These need to be global because the tf.Dataset.map used for pp above doesn't accept kwargs
     IMG_SIZE = args.pop('image_size')
-    INT_IMG_SIZE = args.pop('intermediate-image_size')
-    AUTOTUNE = args.pop('autotune')
+    INT_IMG_SIZE = args.pop('intermediate_image_size')
+    AUTOTUNE = tf.data.AUTOTUNE  #args.pop('autotune')
 
     main(**args)
