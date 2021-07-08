@@ -7,7 +7,6 @@ import tensorflow as tf
 from keras import backend as K
 from keras.callbacks import TensorBoard, ReduceLROnPlateau
 from keras.optimizers import Adam
-from keras.utils import multi_gpu_model
 
 # c.f. https://github.com/qubvel/segmentation_models/issues/374
 import os
