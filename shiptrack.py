@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import argparse, os
 import numpy as np
 from pathlib import Path
@@ -30,6 +31,11 @@ losses = {'jaccard_loss': jaccard_loss,
           'binary_focal_dice_loss': binary_focal_dice_loss,
           'binary_focal_jaccard_loss': binary_focal_jaccard_loss}
 
+# Set default values. These need to be global because the tf.Dataset.map used for pp above doesn't accept kwargs
+IMG_SIZE = 448
+INT_IMG_SIZE = (2240, 1344)
+AUTOTUNE = tf.data.AUTOTUNE  #args.pop('autotune')
+
 
 def fit_model(model, train_dataset, val_dataset, epochs=1, tensorboard_dir=''):
 
@@ -57,68 +63,44 @@ def str2bool(v):
 def load_numpy_arrays(training_dir):
     import os
 
-    if os.path.isfile(os.path.join(training_dir, 'data.npz')):
-        all_data = np.load(os.path.join(training_dir, 'data.npz'))['arr_0']
-    elif os.path.isfile(os.path.join(training_dir, 'data.npy')):
-        all_data = np.load(os.path.join(training_dir, 'data.npy'))
-    else:
-        raise ValueError("No training data found")
-
-    all_labels = np.load(os.path.join(training_dir, 'labels.npz'))['arr_0']
+    all_data = np.memmap(os.path.join(training_dir, 'data.memmap'), dtype='uint8', mode='r', shape=(2205, 2030, 1354, 4))
+    all_labels = np.memmap(os.path.join(training_dir, 'labels.memmap'), dtype='uint8', mode='r', shape=(2205, 2030, 1354))
 
     # Drop the alpha
     if all_data.shape[3] == 4:
         all_data = all_data[..., :3]
-
-    # If we have more than one class, collapse them all together (we're not trying different types)
-    #if all_labels.shape[3] > 2:
-    #    all_labels[..., 1] = all_labels.any(axis=3).astype('uint8')
-    #    all_labels = all_labels[..., 0:2]
-
-    # Shuffle the data in-place since the original training datasets are roughly ordered
-    # Set a fixed seed for reproducibility
-    R_SEED = 12345
-    rstate = np.random.RandomState(R_SEED)
-    rstate.shuffle(all_data)
-    rstate = np.random.RandomState(R_SEED)  # Be sure to shuffle the labels using the same seed
-    rstate.shuffle(all_labels)
 
     return all_data, all_labels
 
 def get_generator(all_data, all_labels):
 
     for data, labels in zip(all_data, all_labels):
-        print(data)
         # Resize the data
         _data = tf.image.resize(data, INT_IMG_SIZE) / 255.
-        _labels = tf.squeeze(tf.image.resize(tf.expand_dims(labels, -1), INT_IMG_SIZE, 'nearest')) # Adding an extra color dim for tf.image
-        print(_data)
-        print(_labels)
+        _labels = tf.image.resize(tf.expand_dims(labels, -1), INT_IMG_SIZE, 'nearest') # Adding an extra color dim for tf.image
 
         # Slice the images to the final size...
-        flat_patches = tf.image.extract_patches(images=_data,
-                                                sizes=[1, IMG_SIZE, IMG_SIZE, 3],
-                                                strides=[1, IMG_SIZE, IMG_SIZE, 3],  # This should be the same as sizes
+        flat_patches = tf.image.extract_patches(images=tf.expand_dims(_data, axis=0),
+                                                sizes=[1, IMG_SIZE, IMG_SIZE, 1],
+                                                strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
                                                 rates=[1, 1, 1, 1],
                                                 padding='VALID')
         _data = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE, 3])  # Stack them along the leading dim
 
         # ...And the labels
-        flat_patches = tf.image.extract_patches(images=_labels,
-                                                sizes=[1, IMG_SIZE, IMG_SIZE],
-                                                strides=[1, IMG_SIZE, IMG_SIZE],  # This should be the same as sizes
-                                                rates=[1, 1, 1],
+        flat_patches = tf.image.extract_patches(images=tf.expand_dims(_labels, axis=0),
+                                                sizes=[1, IMG_SIZE, IMG_SIZE, 1],
+                                                strides=[1, IMG_SIZE, IMG_SIZE, 1],  # This should be the same as sizes
+                                                rates=[1, 1, 1, 1],
                                                 padding='VALID')
         _labels = tf.reshape(flat_patches, [-1, IMG_SIZE, IMG_SIZE])  # Stack them along the leading dim
-        print("done slicing")
 
-        has_labels = (tf.reshape(_labels, [-1, IMG_SIZE*IMG_SIZE]) > 0).any(1)
-        print(has_labels)
+        has_labels = tf.math.reduce_any(tf.reshape(_labels, [-1, IMG_SIZE*IMG_SIZE]) > 0, axis=1)
         _data = tf.boolean_mask(_data, has_labels)
         _labels = tf.boolean_mask(_labels, has_labels)
         yield _data, _labels
 
-
+        
 def resize_and_rescale(image, label):
     image = tf.cast(image, tf.float32)
 
@@ -161,20 +143,23 @@ def get_data(training_dir, test_prop, batch_size, augment):
     n_test = (all_data.shape[0] // 100) * test_prop
     n_val = int((all_data.shape[0]-n_test)*0.181818)  # Fixed validation proportion of ~15% of original dataset
     n_train = all_data.shape[0]-n_test-n_val
-
-    x_test, x_val, x_train = np.split(all_data, [n_test, n_test+n_val])
-    y_test, y_val, y_train = np.split(all_labels, [n_test, n_test+n_val])
+    
+    x_test, x_val, x_train = all_data[:n_test], all_data[n_test:n_test+n_val], all_data[n_test+n_val:]
+    y_test, y_val, y_train = all_labels[:n_test], all_labels[n_test:n_test+n_val], all_labels[n_test+n_val:]
 
     print(n_test, 'test samples')
     print(n_val, 'val samples')
     print(n_train, 'train samples')
 
     sig = output_signature=(
-         tf.TensorSpec(shape=(None, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float64),
-         tf.TensorSpec(shape=(None, IMG_SIZE, IMG_SIZE), dtype=tf.int32))
-    test_ds = tf.data.Dataset.from_generator(get_generator, args=(x_test, y_test), output_signature=sig)
-    val_ds = tf.data.Dataset.from_generator(get_generator, args=(x_val, y_val), output_signature=sig)
-    train_ds = tf.data.Dataset.from_generator(get_generator, args=(x_train, y_train), output_signature=sig)
+         tf.TensorSpec(shape=(15, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float64),
+         tf.TensorSpec(shape=(15, IMG_SIZE, IMG_SIZE), dtype=tf.int32))
+    test_ds = tf.data.Dataset.from_generator(get_generator, args=(x_test, y_test), output_signature=sig).unbatch()
+
+    val_ds = tf.data.Dataset.from_generator(get_generator, args=(x_val, y_val), output_signature=sig).unbatch()
+
+    train_ds = tf.data.Dataset.from_generator(get_generator, args=(x_train, y_train), output_signature=sig).unbatch()
+
 
     if augment:
         # Create counter and zip together with train dataset
@@ -192,24 +177,24 @@ def get_data(training_dir, test_prop, batch_size, augment):
 
     train_ds = (
         train_ds
-            .shuffle(10)
+#             .shuffle(10)
 #            .map(train_fn, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
-            .prefetch(AUTOTUNE)
+#             .prefetch(AUTOTUNE)
     )
 
     val_ds = (
         val_ds
 #            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
-            .prefetch(AUTOTUNE)
+#             .prefetch(AUTOTUNE)
     )
 
     test_ds = (
         test_ds
 #            .map(resize_and_rescale, num_parallel_calls=AUTOTUNE)
             .batch(batch_size)
-            .prefetch(AUTOTUNE)
+#             .prefetch(AUTOTUNE)
     )
 
     return test_ds, val_ds, train_ds
@@ -223,9 +208,13 @@ def main(training, epochs, learning_rate, batch_size, model_dir,
     print("got data")
 
     # preprocess input
-    preprocess_input = get_preprocessing(backbone)
-    train_ds = preprocess_input(train_ds[0])
+    # This dies when evaluating or iterating on the x_train Dataset with the following exception:
+    # [libprotobuf FATAL external/com_google_protobuf/src/google/protobuf/wire_format_lite.cc:504] CHECK failed: (value.size()) <= (kint32max): 
+    # Segmentation fault (core dumped)
 
+    # The problem seems to be related to either a memory leak in the from_generator method or this: https://github.com/tensorflow/tensorflow/issues/46089
+    print(list(train_ds.take(3)))
+    
     print("processed input")
     
     # Automatically mirror training across all available GPUs
@@ -260,9 +249,9 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--model_dir', type=str, default=os.environ['SM_MODEL_DIR'])
-    parser.add_argument('--tensorboard-dir', type=str, default=Path(os.environ.get('SM_MODULE_DIR')).parent.parent)
-    parser.add_argument('--training', type=str, default=os.environ['SM_CHANNEL_TRAINING'])
+    parser.add_argument('--model_dir', type=str, default=os.environ.get('SM_MODEL_DIR', ''))
+    parser.add_argument('--tensorboard-dir', type=str, default=Path(os.environ.get('SM_MODULE_DIR', '')).parent.parent)
+    parser.add_argument('--training', type=str, default=os.environ.get('SM_CHANNEL_TRAINING'))
 #     parser.add_argument('--validation', type=str, default=os.environ['SM_CHANNEL_VALIDATION'])
     parser.add_argument("--augment", type=str2bool, nargs='?',
                             const=True, default=False,
