@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Run inference over a (possibly remote) dataset using a saved tf model
+Run inference over a dataset using a saved tf model
 """
 import matplotlib
 matplotlib.use('agg')
@@ -10,9 +10,35 @@ import numpy as np
 import argparse
 import matplotlib.pyplot as plt
 
-# normalise = lambda data: [(d - mean_data)/std_data for d in data]
-# normalise = lambda data: (data - 0.5)/0.25
-normalise = lambda data: [(d - 0.45)/0.25 for d in data]
+
+IMG_SIZE = 448
+INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
+
+
+def vectoriser(arr, level=0.2, latlon=True):
+    """
+    input: arr -> a square 2D binary mask array
+    output: polys -> a list of vectorised polygons
+    
+    From https://gist.github.com/Lkruitwagen/26c6ba8cadbfd89ab42f36f6a3bbdd35
+    """    
+    from skimage import measure
+    
+    polys = []
+
+    contours = measure.find_contours(arr, level)
+    
+    for c in contours:
+        if latlon:
+            # FIXME: This will need a da piping through (maybe this fn should always expect an xr.da?)
+            c = np.stack([da.longitude[(np.round(c[:,1])).astype('int')], da.latitude[(np.round(c[:,0])).astype('int')]], 1)
+        else:
+            c.T[[0, 1]] = c.T[[1, 0]] # swap lons<->lats
+        poly = geometry.Polygon(c) # pass into geometry
+        polys.append(poly)
+    # TODO: Should this return a shapely MultiPolygon or a GeoDataFrame...?
+#     return geometry.MultiPolygon(polys)
+    return geopandas.GeoDataFrame({"geometry": polys})
 
 
 def split_array(arr, step_size=440):
@@ -23,34 +49,18 @@ def split_array(arr, step_size=440):
     return sum((np.array_split(v_split, y_split_locs, axis=1) for v_split in v_splits), [])
 
 
-def process_typed_file(file, image_size, resize=False, channel=None):
+def get_image(file):
     from PIL import ImageOps, Image
 
     im_data = Image.open(file)
-    if (im_data.size[1] not in [2030, 2040]) or (im_data.size[0] != 1354):
-        print("Skipping wierd shape: {}".format(im_data.size))
-        raise ValueError()
     
-    original_shape = im_data.size
-    
-    if resize:
-        im_data = im_data.resize(image_size, resample=Image.BILINEAR)
-        padding = 0
-    else:  # Pad
-        # expand by 160, 80 on each side
-        padding = 85 if im_data.size[1] == 2030 else 80
-        im_data = ImageOps.expand(im_data, padding)
-
     # Drop the alpha channel
     im_data = np.array(im_data)[:, :, 0:3]
     
-    if channel is not None:
-        im_data = im_data[..., channel]
-
-    return im_data, original_shape
+    return im_data
 
 
-def resize(arr, target_size, bilinear=False):
+def resize_arr(arr, target_size, bilinear=True):
     from PIL import Image
     
     resampler = Image.BILINEAR if bilinear else Image.NEAREST
@@ -62,59 +72,31 @@ def resize(arr, target_size, bilinear=False):
     new_arr = np.array(arr_im)
     return new_arr
 
-def combine_and_resize_masks(masks, original_size):
-    from PIL import Image
 
-    #print(masks.shape)
-    # TODO: Make the nesting a parameter
-    nested_masks = [np.split(m, 4) for m in np.split(masks[..., 0], 3, 0)]
-#     print(len(nested_masks))
-#     print(nested_masks[0][0].shape)
-#     nested_masks = np.reshape(masks, (5, 8))
-    #print([m.shape for m in nested_masks])
-    
+def combine_masks(masks):
+
+    nested_masks = [np.split(m, 3) for m in np.split(masks[..., 0], 5, 0)]
     mask = np.squeeze(np.block(nested_masks))
-    #print(mask.shape)
-    #print(mask.any())
 
-    new_mask = resize(mask, original_size)
-    
-    return new_mask
+    return mask
 
 
 def get_ship_track_mask(f):
-    data, original_size = process_typed_file(f, (448*4, 448*3), resize=True)
-    #plt.imshow(data)
-    #plt.show()
-    # norm_data = normalise(data)
-    print("Original size: " + str(original_size))
-    print("Re-shaped shape: " + str(data.shape))
-
-    # split_data = normalise(split_array(np.concatenate([data[..., 0:1]/255.]*3, axis=-1), 448))
-    split_data = split_array(data, 448)
-
-    prediction = tf_predictor(inputs=tf.constant(np.stack(split_data), dtype='float32'))
-
-    prediction = prediction['sigmoid_1/concat:0'] > 0.5
-
-    combined_prediction = combine_and_resize_masks(prediction, original_size)
-
-    #plt.imshow(combined_prediction)
-    #plt.show()
+    data  = get_image(f)
     
-    # Test the recombination is working correctly
-    #combined_data = combine_and_resize_masks(np.stack(split_data), original_size)
-    #print("Testing data combination:")
-    #print("Recombined shape: " + str(combined_data.shape))
+    original_size = data.shape[1::-1] # The size is the inverse of the shape (minus the color channel)
 
-    #plt.imshow(combined_data)
-    #plt.show()
-    #print("Reshaped data: " + str(data[100,100,0]))
-    #print("Recomnbined data: " + str(combined_data[100,100]))
+    reshaped_data = resize_arr(data, INT_IMG_SIZE[::-1])
+    
+    split_data = split_array(reshaped_data / 255., IMG_SIZE)
 
-    original_size_data = resize(data, original_size, bilinear=True)
+    prediction = tf_predictor(data=tf.constant(split_data, dtype='float32'))
 
-    return original_size_data, combined_prediction
+    mask = combine_masks(prediction['sigmoid'])
+    
+    new_mask = resize_arr(mask, original_size)
+    
+    return data, new_mask
 
 
 if __name__ == '__main__':
@@ -128,12 +110,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # tf_predictor = tf.keras.models.load_model(args.model+'/1/')
-    model = tf.saved_model.load(args.model+'/1/')
+    model = tf.saved_model.load(args['model'])
     tf_predictor = model.signatures["serving_default"]
-    print(tf_predictor)
-    # Check its architecture
-    # tf_predictor.summary()
 
     if args.infile is not None:
         print("Reading filelist from {}".format(args.infile))
@@ -143,17 +121,20 @@ if __name__ == '__main__':
 
     for f in infiles:
         data, mask = get_ship_track_mask(f)
-
-        print(data.shape)
-        print(mask.any())
-        print(mask.shape)
-        if mask.any():
-            if args.show:
-                fig, axs = plt.subplots(figsize=(20, 40))
-                axs.imshow(data, vmin=0., vmax=1.)
-                im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
-        #         plt.colorbar(im)
-                plt.savefig(f"{f[:-4]}_{args.outfile}.png")
-            np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
-        else:
-            print(f"No shiptracks found in {f}")
+        
+        # Get the polygons in image coordinates
+        #polys = vectoriser(mask, level=0.2, latlon=False)
+        
+        # Get the polygons in lat/lon coordinates (FIXME this will require an xarray da with the right coordinates)
+        #polys = vectoriser(mask, level=0.2, latlon=True)
+        
+        # TODO: Save to PostGIS DB?
+        
+        # Save the mask?
+        np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
+        
+        if args.show:
+            fig, axs = plt.subplots(figsize=(20, 40))
+            axs.imshow(data, vmin=0., vmax=1.)
+            im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
+            plt.savefig(f"{f[:-4]}_{args.outfile}.png")
