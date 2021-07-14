@@ -110,7 +110,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    model = tf.saved_model.load(args['model'])
+    model = tf.saved_model.load(args.model)
     tf_predictor = model.signatures["serving_default"]
 
     if args.infile is not None:
