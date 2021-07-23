@@ -87,7 +87,7 @@ def get_ship_track_mask(f):
     # netcdf dataset open
     if f.endswith(".nc"):
         ds = xr.open_dataset(f)
-        data = ds['day_microphysics'].data.load()
+        data = np.array(ds['day_microphysics'].data)
     else:
         data  = get_image(f)
     
