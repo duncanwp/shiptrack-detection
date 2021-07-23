@@ -140,21 +140,27 @@ if __name__ == '__main__':
         infiles = args.infiles
 
     for f in infiles:
-        data, mask = get_ship_track_mask(f)
+
+        outputs = get_ship_track_mask(f)
         
-        # Get the polygons in image coordinates
-        #polys = vectoriser(mask, level=0.2, latlon=False)
-        
-        # Get the polygons in lat/lon coordinates (FIXME this will require an xarray da with the right coordinates)
-        #polys = vectoriser(mask, level=0.2, latlon=True)
-        
-        # TODO: Save to PostGIS DB?
-        
-        # Save the mask?
-        np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
-        
-        if args.show:
-            fig, axs = plt.subplots(figsize=(20, 40))
-            axs.imshow(data, vmin=0., vmax=1.)
-            im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
-            plt.savefig(f"{f[:-4]}_{args.outfile}.png")
+        if type(outputs) == xr.Dataset:
+            outputs.to_netcdf(f"{f[:-4]}_{args.outfile}_mask.nc")
+
+        else:
+                
+            # Get the polygons in image coordinates
+            #polys = vectoriser(mask, level=0.2, latlon=False)
+            
+            # Get the polygons in lat/lon coordinates (FIXME this will require an xarray da with the right coordinates)
+            #polys = vectoriser(mask, level=0.2, latlon=True)
+            
+            # TODO: Save to PostGIS DB?
+            
+            # Save the mask?
+            np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
+            
+            if args.show:
+                fig, axs = plt.subplots(figsize=(20, 40))
+                axs.imshow(data, vmin=0., vmax=1.)
+                im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
+                plt.savefig(f"{f[:-4]}_{args.outfile}.png")
