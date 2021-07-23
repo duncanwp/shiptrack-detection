@@ -5,6 +5,7 @@ Run inference over a dataset using a saved tf model
 import matplotlib
 matplotlib.use('agg')
 
+import xarray as xr
 import tensorflow as tf
 import numpy as np
 import argparse
@@ -82,7 +83,13 @@ def combine_masks(masks):
 
 
 def get_ship_track_mask(f):
-    data  = get_image(f)
+
+    # netcdf dataset open
+    if f.endswith(".nc"):
+        ds = xr.open_dataset(f)
+        data = ds['day_microphysics'].data.load()
+    else:
+        data  = get_image(f)
     
     original_size = data.shape[1::-1] # The size is the inverse of the shape (minus the color channel)
 
@@ -96,7 +103,20 @@ def get_ship_track_mask(f):
     
     new_mask = resize_arr(mask, original_size)
     
-    return data, new_mask
+    # return dataset or plain arrays.
+    # try except is faster?
+    if f.endswith(".nc"):
+        # add the mask back into the dataset
+        ds['mask'] = xr.Variable(
+            dims=['y','x'],
+            data=new_mask
+        )
+
+        return ds
+    
+    else:
+        return data, new_mask
+
 
 
 if __name__ == '__main__':
