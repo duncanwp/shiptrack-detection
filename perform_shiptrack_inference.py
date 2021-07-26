@@ -6,6 +6,8 @@ import matplotlib
 matplotlib.use('agg')
 
 import xarray as xr
+import rasterio
+import shapely
 import tensorflow as tf
 import numpy as np
 import argparse
@@ -42,6 +44,68 @@ def vectoriser(arr, level=0.2, latlon=True):
     return geopandas.GeoDataFrame({"geometry": polys})
 
 
+def xr_vectoriser(da, level=0.2, loop='ListComp'):
+    """
+    input: arr -> a square 2D binary mask array
+    output: polys -> a list of vectorised polygons
+    
+    From https://gist.github.com/Lkruitwagen/26c6ba8cadbfd89ab42f36f6a3bbdd35
+    """    
+    from skimage import measure
+        
+    contours = measure.find_contours(da.data, level)
+    
+    # list comprehension
+    # 34.9 s ± 107 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+    # 2792 contours processed
+    if loop == 'ListComp':
+        
+        polygons = [
+            Polygon([(float(ds['longitude'][x,y]),
+                      float(ds['latitude'][x,y])) \
+                     for (x,y) in c.astype(int)])\
+            for c in filter(lambda x:len(x) > 3,contours)]
+
+    # normal for loop
+    # 34.7 s ± 185 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+    # 2792 contours processed
+    elif loop == 'ForLoop':
+
+        polygons = []
+
+        for c in tqdm(contours):
+            
+            lon_lat_pairs = []
+            
+            for (x,y) in c.astype(int):
+                lon = float(ds['longitude'][x,y])
+                lat = float(ds['latitude'][x,y])
+                
+                lon_lat_pairs.append((lon,lat))
+            
+        # catch exception when lat_lon_pairs
+        # has len < 3
+        try:
+            polygon = Polygon(lon_lat_pairs)
+            polygons.append(polygon)
+
+        except AttributeError:
+            pass
+        
+    # 10.2 s ± 66.9 ms per loop (mean ± std. dev. of 7 runs, 1 loop each
+    # 2791 contours processed
+    elif loop == 'MapPool':
+        
+        with Pool(4) as p:
+            polygons = p.map(
+                make_polygon,
+                contours
+            )
+
+    return gpd.GeoDataFrame({"geometry": polygons})
+
+
+
 def split_array(arr, step_size=440):
     x_len, y_len = arr.shape[0:2]
     x_split_locs = range(step_size, x_len, step_size)
@@ -66,7 +130,7 @@ def resize_arr(arr, target_size, bilinear=True):
     
     resampler = Image.BILINEAR if bilinear else Image.NEAREST
     
-    arr_im = Image.fromarray(arr)
+    arr_im = Image.fromarray(arr) 
 
     arr_im = arr_im.resize(target_size, resample=resampler)
     
@@ -81,13 +145,18 @@ def combine_masks(masks):
 
     return mask
 
-
 def get_ship_track_mask(f):
 
     # netcdf dataset open
     if f.endswith(".nc"):
         ds = xr.open_dataset(f)
-        data = np.array(ds['day_microphysics'].data)
+
+        # reorder dims to put bands last
+        ds = ds.transpose('y','x','bands')
+
+        # convert to numpy array, move to PIL compatible array...
+        data = (np.array(ds['day_microphysics'].data)*255).astype(np.uint8)
+
     else:
         data  = get_image(f)
     
