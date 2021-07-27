@@ -262,7 +262,7 @@ if __name__ == '__main__':
         rgb_array = pre_processing(rgb_array)
 
         # perform inference on rgb
-        inferred_ship_tracks = get_ship_track_array(rgb_array)
+        inferred_ship_tracks = get_ship_track_array(rgb_array, tf_predictor)
       
         # construct output filename from input filename
         stem = os.path.stem(file)
