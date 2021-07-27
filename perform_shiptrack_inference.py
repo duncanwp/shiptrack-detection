@@ -210,7 +210,7 @@ def pre_processing(rgb_array):
     # histogram stretching
     # image resizing etc
     # return array
-    pass
+    return rgb_array
 
 def post_processing(output, extension):
     # perform post processing as desired
@@ -267,7 +267,6 @@ if __name__ == '__main__':
         # construct output filename from input filename
         stem = os.path.stem(file)
         out_name = os.path.join(stem, args.outsuffix, args.outextension)
-
 
         # NETCDF input
         if file[-3:] in [".nc", "hdf"]:
