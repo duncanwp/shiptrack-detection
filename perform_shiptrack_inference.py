@@ -165,7 +165,7 @@ def get_ship_track_array(rgb_array, tf_predictor):
     split_rgb_array = split_array(reshaped_rgb_array / 255., IMG_SIZE)
 
     # call model for inference
-    prediction = tf_predictor(rgb_array=tf.constant(split_rgb_array, dtype='float32'))
+    prediction = tf_predictor(data=tf.constant(split_rgb_array, dtype='float32'))
 
     # stitch and resize output back to original size
     inferred_ship_tracks = combine_masks(prediction['sigmoid'])
