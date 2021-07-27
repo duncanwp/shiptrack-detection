@@ -1,21 +1,32 @@
 #!/usr/bin/env python
 """
 Run inference over a dataset using a saved tf model
+
+@ anla
+    
+    What operations can we perform on the GPU to give speedup?
+    * image enhancement? (currently histogram stretching is done before)
+    * contour finding?
+    * coordinate lookup for converting contours from x,y to lon,lat?
+
+
 """
 import matplotlib
 matplotlib.use('agg')
 
+from tqdm import tqdm
 import xarray as xr
-import rasterio
-import shapely
 import tensorflow as tf
 import numpy as np
 import argparse
 import matplotlib.pyplot as plt
+import pandas as pd
+import geopandas as gpd
+import os
 
-
-IMG_SIZE = 448
-INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
+# Use of globals like this I do not like...
+# IMG_SIZE = 448
+# INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
 
 
 def vectoriser(arr, level=0.2, latlon=True):
@@ -128,6 +139,7 @@ def get_image(file):
 def resize_arr(arr, target_size, bilinear=True):
     from PIL import Image
     
+    # @anla : I don't like this hidden behaviour
     resampler = Image.BILINEAR if bilinear else Image.NEAREST
     
     arr_im = Image.fromarray(arr) 
@@ -145,48 +157,68 @@ def combine_masks(masks):
 
     return mask
 
-def get_ship_track_mask(f):
+def get_ship_track_array(rgb_array, tf_predictor):
 
-    # netcdf dataset open
-    if f.endswith(".nc"):
-        ds = xr.open_dataset(f)
+    # reshape and split array prior to inference
+    original_size = rgb_array.shape[1::-1] # The size is the inverse of the shape (minus the color channel)
+    reshaped_rgb_array = resize_arr(rgb_array, INT_IMG_SIZE[::-1])
+    split_rgb_array = split_array(reshaped_rgb_array / 255., IMG_SIZE)
 
+    # call model for inference
+    prediction = tf_predictor(rgb_array=tf.constant(split_rgb_array, dtype='float32'))
+
+    # stitch and resize output back to original size
+    inferred_ship_tracks = combine_masks(prediction['sigmoid'])
+    inferred_ship_tracks = resize_arr(inferred_ship_tracks, original_size)
+    
+    return inferred_ship_tracks
+
+def load_data(filename):
+    # utility function to handle different inputs
+    # takes filename, returns rgb_array
+    # metadata can be picked up later
+
+    # NETCDF
+    if filename.endswith(".nc"):
+        # open netcdf with xarray
+        ds = xr.open_dataset(filename)
+
+        # transpose dimensions to PIL compatible
+        # netcdf dataset open
+    
         # reorder dims to put bands last
         ds = ds.transpose('y','x','bands')
 
         # convert to numpy array, move to PIL compatible array...
-        data = (np.array(ds['day_microphysics'].data)*255).astype(np.uint8)
+        rgb_array = (np.array(ds['day_microphysics'].data)*255).astype(np.uint8)
 
-    else:
-        data  = get_image(f)
+        # return plain rgb array for further processing
+        return rgb_array
+
     
-    original_size = data.shape[1::-1] # The size is the inverse of the shape (minus the color channel)
+    # PNG
+    elif filename.endswith(".png"):
+        # open png with PIL
+        img = Image.open(filename)
+        # turn to numpy array, dropping alpha
+        rgb_array = np.array(img)[:, :, 0:3] 
+        
+        return rgb_array
 
-    reshaped_data = resize_arr(data, INT_IMG_SIZE[::-1])
-    
-    split_data = split_array(reshaped_data / 255., IMG_SIZE)
+def pre_processing(rgb_array):
+    # perform pre_processing steps
+    # histogram stretching
+    # image resizing etc
+    # return array
+    pass
 
-    prediction = tf_predictor(data=tf.constant(split_data, dtype='float32'))
+def post_processing(output, extension):
+    # perform post processing as desired
+    pass
 
-    mask = combine_masks(prediction['sigmoid'])
-    
-    new_mask = resize_arr(mask, original_size)
-    
-    # return dataset or plain arrays.
-    # try except is faster?
-    if f.endswith(".nc"):
-        # add the mask back into the dataset
-        ds['mask'] = xr.Variable(
-            dims=['y','x'],
-            data=new_mask
-        )
-
-        return ds
-    
-    else:
-        return data, new_mask
-
-
+def write_output(output, outname, **kwargs):
+    # write output to file
+    pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -195,12 +227,24 @@ if __name__ == '__main__':
     parser.add_argument('infiles', nargs='*')
     parser.add_argument('--infile', help="Input file", type=argparse.FileType('r'))
     parser.add_argument('--show', action='store_true')
-    parser.add_argument('-o', '--outfile', help="Output name", default='mask')
+
+    parser.add_argument('--outsuffix', help="suffix of output file", default='_inferred_ship_tracks')
+    parser.add_argument('--outextension', help="file extension", default='.nc')
+
+    parser.add_argument("--imsize", help="block size magic number",default=448)
+    
+    parser.add_argument('-l','--level', help="level of inference contour for geometry output", default=0.2)
 
     args = parser.parse_args()
+    
 
-    model = tf.saved_model.load(args.model)
-    tf_predictor = model.signatures["serving_default"]
+    # globals 
+    IMG_SIZE = args.imsize
+    INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
+
+    # load (compile?) trained model
+    MODEL = tf.saved_model.load(args.model)
+    tf_predictor = MODEL.signatures["serving_default"]
 
     if args.infile is not None:
         print("Reading filelist from {}".format(args.infile))
@@ -208,12 +252,69 @@ if __name__ == '__main__':
     else:
         infiles = args.infiles
 
-    for f in infiles:
+    # main loop through input files...
+    for file in tqdm(infiles):
 
-        outputs = get_ship_track_mask(f)
-        
-        if type(outputs) == xr.Dataset:
-            outputs.to_netcdf(f"{f[:-4]}_{args.outfile}_mask.nc")
+        # read in the data
+        rgb_array = load_data(file)
+
+        # preprocess the data
+        rgb_array = pre_processing(rgb_array)
+
+        # perform inference on rgb
+        inferred_ship_tracks = get_ship_track_array(rgb_array)
+      
+        # construct output filename from input filename
+        stem = os.path.stem(file)
+        out_name = os.path.join(stem, args.outsuffix, args.outextension)
+
+
+        # NETCDF input
+        if file[-3:] in [".nc", "hdf"]:
+            ds = xr.open_dataset(file)
+            ds['ship_tracks'] = xr.Variable(
+                dims=['y','x'],
+                data=inferred_ship_tracks,
+                attrs={'description':'inferred ship track array'},
+            )
+
+            if args.outextension == ".nc":
+                ds.to_netcdf(out_name)              
+
+            # SHAPE FILE OUTPUT      
+            elif args.outextension == "shp":
+                # assume shapefile output
+                # get geometry and add to GeoDataFrame
+                gdf = xr_vectoriser(ds['ship_tracks'], level=args.level, loop='MapPool')
+
+                # add metadata to the GeoDataFrame to describe
+                # @anla : this is a bit hacky
+                df = pd.DataFrame(index=[0])
+                for key, value in ds.attrs.items():
+                    if type(value).__name__ == "datetime":
+                        value = pd.to_datetime(value)
+                        
+                    if type(value) == tuple:
+                        value = ", ".join(value)
+                    try:
+                        df[key]=value
+                    except:
+                        print(f"{key} invalid")
+                
+                # add some more detail
+                df['model'] = args.model
+                df['level'] = args.level
+                df['description'] = f"multipolygon describing contour at level {args.level} of infered ship track probability"
+
+                # drop invalid column
+                df = df.drop(columns='area')
+
+                # join dataframe with geodataframe
+                gdf = gdf.join(df.astype(str))
+
+                # write to shapefile
+                gdf.to_file(out_name)
+
 
         else:
                 
@@ -226,10 +327,10 @@ if __name__ == '__main__':
             # TODO: Save to PostGIS DB?
             
             # Save the mask?
-            np.savez_compressed(f"{f[:-4]}_{args.outfile}.npz", mask=mask)
+            np.savez_compressed(f"{file[:-4]}_{args.outfile}.npz", mask=inferred_ship_tracks)
             
             if args.show:
                 fig, axs = plt.subplots(figsize=(20, 40))
-                axs.imshow(data, vmin=0., vmax=1.)
-                im=axs.imshow(mask, alpha=0.5, vmin=0, vmax=1)
-                plt.savefig(f"{f[:-4]}_{args.outfile}.png")
+                axs.imshow(rgb_array, vmin=0., vmax=1.)
+                im=axs.imshow(inferred_ship_tracks, alpha=0.5, vmin=0, vmax=1)
+                plt.savefig(f"{file[:-4]}_{args.outfile}.png")
