@@ -265,8 +265,7 @@ if __name__ == '__main__':
         inferred_ship_tracks = get_ship_track_array(rgb_array, tf_predictor)
       
         # construct output filename from input filename
-        stem = os.path.stem(file)
-        out_name = os.path.join(stem, args.outsuffix, args.outextension)
+        out_name = os.path.join(file[-4:], args.outsuffix, args.outextension)
 
         # NETCDF input
         if file[-3:] in [".nc", "hdf"]:
