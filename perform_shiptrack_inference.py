@@ -5,9 +5,10 @@ Run inference over a dataset using a saved tf model
 @ anla
     
     What operations can we perform on the GPU to give speedup?
-    * image enhancement? (currently histogram stretching is done before)
-    * contour finding?
-    * coordinate lookup for converting contours from x,y to lon,lat?
+    * image enhancement? (currently histogram stretching is done before) possible?
+    * contour finding? No implementation yet found
+    * coordinate lookup for converting contours from x,y to lon,lat? Only worth it for large number of points.
+
 
 
 """
@@ -23,10 +24,15 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import geopandas as gpd
 import os
+from shapely.geometry import Polygon, MultiPolygon
+# from multiprocessing import Pool
 
 # Use of globals like this I do not like...
 # IMG_SIZE = 448
 # INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
+
+import logging
+logger = logging.getLogger(f"ship_track_inference_as_{__name__}")
 
 
 def vectoriser(arr, level=0.2, latlon=True):
@@ -52,10 +58,19 @@ def vectoriser(arr, level=0.2, latlon=True):
         polys.append(poly)
     # TODO: Should this return a shapely MultiPolygon or a GeoDataFrame...?
 #     return geometry.MultiPolygon(polys)
-    return geopandas.GeoDataFrame({"geometry": polys})
+    return gpd.GeoDataFrame({"geometry": polys})
 
 
-def xr_vectoriser(da, level=0.2, loop='ListComp'):
+def swath_contour_to_geo_polygon(contour, latitudes, longitudes):
+    """convert a single contour from swath coordinates (x,y)
+    to geographic coordinates (lon, lat), given the 
+    latitudes and longitudes arrays"""
+    
+    return Polygon([(float(longitudes[x,y]),
+                  float(latitudes[x,y])) \
+                 for (x,y) in contour.astype(int)])
+
+def xr_vectoriser(da, level=0.2, loop='ListComp')-> gpd.GeoDataFrame:
     """
     input: arr -> a square 2D binary mask array
     output: polys -> a list of vectorised polygons
@@ -66,55 +81,18 @@ def xr_vectoriser(da, level=0.2, loop='ListComp'):
         
     contours = measure.find_contours(da.data, level)
     
-    # list comprehension
-    # 34.9 s ± 107 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
-    # 2792 contours processed
-    if loop == 'ListComp':
+    # filter out those contours that can't make valid polygon
+    contours = filter(lambda x:len(x) > 3,contours)
+    
+    # polygons in swath coodinates (x,y)
+    xy_multipolygon = MultiPolygon([Polygon(c.astype(int)) for c in contours])
+    
+    # polygons in geographic coordinate (lon, lat)
+    geo_multipolygon = MultiPolygon([swath_contour_to_geo_polygon(c, da['latitude'], da['longitude']) for c in contours])
         
-        polygons = [
-            Polygon([(float(ds['longitude'][x,y]),
-                      float(ds['latitude'][x,y])) \
-                     for (x,y) in c.astype(int)])\
-            for c in filter(lambda x:len(x) > 3,contours)]
+    gdf = gpd.GeoDataFrame({"geometry": [xy_multipolygon, geo_multipolygon], "coordinates":["swath","geographic"]})
 
-    # normal for loop
-    # 34.7 s ± 185 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
-    # 2792 contours processed
-    elif loop == 'ForLoop':
-
-        polygons = []
-
-        for c in tqdm(contours):
-            
-            lon_lat_pairs = []
-            
-            for (x,y) in c.astype(int):
-                lon = float(ds['longitude'][x,y])
-                lat = float(ds['latitude'][x,y])
-                
-                lon_lat_pairs.append((lon,lat))
-            
-        # catch exception when lat_lon_pairs
-        # has len < 3
-        try:
-            polygon = Polygon(lon_lat_pairs)
-            polygons.append(polygon)
-
-        except AttributeError:
-            pass
-        
-    # 10.2 s ± 66.9 ms per loop (mean ± std. dev. of 7 runs, 1 loop each
-    # 2791 contours processed
-    elif loop == 'MapPool':
-        
-        with Pool(4) as p:
-            polygons = p.map(
-                make_polygon,
-                contours
-            )
-
-    return gpd.GeoDataFrame({"geometry": polygons})
-
+    return gdf
 
 
 def split_array(arr, step_size=440):
@@ -241,13 +219,15 @@ if __name__ == '__main__':
     # globals 
     IMG_SIZE = args.imsize
     INT_IMG_SIZE = (5*IMG_SIZE, 3*IMG_SIZE)
+    logger.info(f"set image tiling globals : IMG_SIZE={IMG_SIZE}, INT_IMG_SIZE={INT_IMG_SIZE}")
 
     # load (compile?) trained model
+    logger.info(f"loading model {args.model}")
     MODEL = tf.saved_model.load(args.model)
     tf_predictor = MODEL.signatures["serving_default"]
 
     if args.infile is not None:
-        print("Reading filelist from {}".format(args.infile))
+        logger.info("Reading filelist from {}".format(args.infile))
         infiles = args.infile.readlines()
     else:
         infiles = args.infiles
@@ -265,7 +245,7 @@ if __name__ == '__main__':
         inferred_ship_tracks = get_ship_track_array(rgb_array, tf_predictor)
       
         # construct output filename from input filename
-        out_name = os.path.join(file[-4:], args.outsuffix, args.outextension)
+        out_name = file[:-4]+args.outsuffix+args.outextension
 
         # NETCDF input
         if file[-3:] in [".nc", "hdf"]:
@@ -273,43 +253,34 @@ if __name__ == '__main__':
             ds['ship_tracks'] = xr.Variable(
                 dims=['y','x'],
                 data=inferred_ship_tracks,
+                # FIXME @anla : this gets overwritten when contour to geometry
                 attrs={'description':'inferred ship track array'},
             )
-
+            
+            logger.info(args.outextension)
             if args.outextension == ".nc":
+                logger.info("writing netcdf")
                 ds.to_netcdf(out_name)              
 
             # SHAPE FILE OUTPUT      
-            elif args.outextension == "shp":
+            elif args.outextension == ".shp":
                 # assume shapefile output
                 # get geometry and add to GeoDataFrame
-                gdf = xr_vectoriser(ds['ship_tracks'], level=args.level, loop='MapPool')
+                logger.info("computing shapes")
+                gdf = xr_vectoriser(ds['ship_tracks'], level=args.level, loop='ForLoop')
 
-                # add metadata to the GeoDataFrame to describe
-                # @anla : this is a bit hacky
-                df = pd.DataFrame(index=[0])
-                for key, value in ds.attrs.items():
-                    if type(value).__name__ == "datetime":
-                        value = pd.to_datetime(value)
-                        
-                    if type(value) == tuple:
-                        value = ", ".join(value)
-                    try:
-                        df[key]=value
-                    except:
-                        print(f"{key} invalid")
+                # assign attributes from data array to GeoDataFrame
+
+                gdf = gdf.join(pd.DataFrame(columns = ds['day_microphysics'].attrs.keys()))
+
+                for key, value in ds['day_microphysics'].attrs.items():
+                    gdf[key] = str(value)   
+
+                # assign custom values from this operation
+                gdf['model'] = args.model
+                gdf['level'] = args.level
+                gdf['description'] = f"multipolygon describing contour at level {args.level} of infered ship track probability"
                 
-                # add some more detail
-                df['model'] = args.model
-                df['level'] = args.level
-                df['description'] = f"multipolygon describing contour at level {args.level} of infered ship track probability"
-
-                # drop invalid column
-                df = df.drop(columns='area')
-
-                # join dataframe with geodataframe
-                gdf = gdf.join(df.astype(str))
-
                 # write to shapefile
                 gdf.to_file(out_name)
 
