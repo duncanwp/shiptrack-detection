@@ -9,8 +9,6 @@ Run inference over a dataset using a saved tf model
     * contour finding? No implementation yet found
     * coordinate lookup for converting contours from x,y to lon,lat? Only worth it for large number of points.
 
-
-
 """
 import matplotlib
 matplotlib.use('agg')
@@ -24,7 +22,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import geopandas as gpd
 import os
+import re
 from shapely.geometry import Polygon, MultiPolygon
+from datetime import datetime
+
 # from multiprocessing import Pool
 
 # Use of globals like this I do not like...
@@ -82,7 +83,7 @@ def xr_vectoriser(da, level=0.2, loop='ListComp')-> gpd.GeoDataFrame:
     contours = measure.find_contours(da.data, level)
     
     # filter out those contours that can't make valid polygon
-    contours = filter(lambda x:len(x) > 3,contours)
+    contours = list(filter(lambda x:len(x) > 3,contours))
     
     # polygons in swath coodinates (x,y)
     xy_multipolygon = MultiPolygon([Polygon(c.astype(int)) for c in contours])
@@ -90,7 +91,7 @@ def xr_vectoriser(da, level=0.2, loop='ListComp')-> gpd.GeoDataFrame:
     # polygons in geographic coordinate (lon, lat)
     geo_multipolygon = MultiPolygon([swath_contour_to_geo_polygon(c, da['latitude'], da['longitude']) for c in contours])
         
-    gdf = gpd.GeoDataFrame({"geometry": [xy_multipolygon, geo_multipolygon], "coordinates":["swath","geographic"]})
+    gdf = gpd.GeoDataFrame({"geometry": [xy_multipolygon, geo_multipolygon], "coords":["swath","geographic"]})
 
     return gdf
 
@@ -205,7 +206,9 @@ if __name__ == '__main__':
     parser.add_argument('infiles', nargs='*')
     parser.add_argument('--infile', help="Input file", type=argparse.FileType('r'))
     parser.add_argument('--show', action='store_true')
-
+    
+    parser.add_argument('--outdir', required=True, help="path to results directory")
+    
     parser.add_argument('--outsuffix', help="suffix of output file", default='_inferred_ship_tracks')
     parser.add_argument('--outextension', help="file extension", default='.nc')
 
@@ -245,8 +248,23 @@ if __name__ == '__main__':
         inferred_ship_tracks = get_ship_track_array(rgb_array, tf_predictor)
       
         # construct output filename from input filename
-        out_name = file[:-4]+args.outsuffix+args.outextension
+        basename = os.path.basename(file[:-4])+args.outsuffix+args.outextension
 
+        date = datetime.strptime(
+            re.findall("\d+",basename)[0],
+            "%Y%m%d"
+        )
+        
+        date_str = date.strftime("%Y/%m/%d")
+        
+        outdir = os.path.join(args.outdir, date_str)
+        
+        out_name = os.path.join(outdir, basename)
+        
+        # create directory for output
+        if os.path.isdir(outdir) == False:
+            os.makedirs(outdir)
+        
         # NETCDF input
         if file[-3:] in [".nc", "hdf"]:
             ds = xr.open_dataset(file)
