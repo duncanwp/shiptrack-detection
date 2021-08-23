@@ -289,7 +289,25 @@ if __name__ == '__main__':
         
         # perform inference on rgb
         inferred_ship_tracks = get_ship_track_array(rgb_array, tf_predictor)
+<<<<<<< HEAD
                 
+=======
+      
+        # construct output filename from input filename
+        basename = os.path.basename(file[:-4])+args.outsuffix+args.outextension
+
+        date = datetime.strptime(
+            re.findall("\d+",basename)[0],
+            "%Y%m%d"
+        )
+        
+        date_str = date.strftime("%Y/%m/%d")
+        
+        outdir = os.path.join(args.outdir, date_str)
+        
+        out_name = os.path.join(outdir, basename)
+        
+>>>>>>> refs/remotes/origin/angus_comments
         # create directory for output
         if os.path.isdir(outdir) == False:
             os.makedirs(outdir)
