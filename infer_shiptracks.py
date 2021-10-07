@@ -10,6 +10,24 @@ that only accepts netcdf input files and returns either netcdf of gpkg
     * contour finding? No implementation yet found
     * coordinate lookup for converting contours from x,y to lon,lat? Only worth it for large number of points.
 
+ISSUES:
+
+    The main issue with this script is the pattern, list comprehensions to tf.data.Dataset,
+    which does not make best use of the tf.data.Dataset class and cannot prefetch the data
+    for higher performance.
+
+    It would be nice to use the .map and .prefetch and .batch methods in a meaningful way.
+
+    Currently, PIL is causing a loss of colourspace resolution. We rely on it for reshaping
+    the images to a common shape. However, PIL will not accept a 3 channel (RGB) array unless 
+    it is of the data type uint8 and has values between 0 and 255. Conversely, the model
+    expects Tensors with floating dtype with values between 0 and 1.
+
+    We could use tf.image to do the resizing and maybe splitting. However, these are known to
+    have unexpected behaviour that is somewhat different to PIL. Never-the-less, it would be 
+    good to lean into the tensorflow 'ecosystem' more, as that should lead to better performance
+    and more canomical workflows and syntax.
+
 """
 from tqdm import tqdm
 import xarray as xr
@@ -23,6 +41,7 @@ import os
 import re
 from shapely.geometry import Polygon, MultiPolygon
 from datetime import datetime
+from functools import reduce
 import logging
 
 logger = logging.getLogger(f"ship_track_inference_as_{__name__}")
@@ -231,8 +250,14 @@ if __name__ == '__main__':
         
         logger.info(f"processing {len(file_batch)} files")
         
-        # out names
+        # out names, to be manipulated further depending on format of output.
         outnames = [make_outname(file, args.outdir, args.outsuffix) for file in file_batch]
+
+        logger.info(f"creating output directories if required")
+        for outname in outnames:
+            if os.path.isdir(os.path.dirname(outname)) == False:
+                logger.debug(f"creating {os.path.dirname(outname)}")
+                os.makedirs(os.path.dirname(outname))
         
         # logic to skip if outname exists!... comment out
         # file_batch = [file for (file, name) in zip(file_batch, outnames) if os.path.isfile(name) == True]
@@ -248,16 +273,18 @@ if __name__ == '__main__':
 
         logger.info("load the unlablled data")
         rgb_arrays = [np.array(x.astype('float32').data) for x in dataarrays]
-        logger.debug(f"rgb array list has elements {rgb_arrays[0]}")
 
         logger.info("resize the rgb_arrays")
         # PIL will not accept floating point, only ints betwee 0 and 255
         rgb_arrays = [resize_arr((x*255).astype(np.uint8), INT_IMG_SIZE[::-1]) for x in rgb_arrays]
 
         logger.info("split into expected image shape")
-        # recast to float32 between 0 and 1, loss of resolutoin
+        # recast to float32 between 0 and 1, loss of resolution
         split_rgb_arrays = [split_array((x/255.).astype(np.float32), IMG_SIZE) for x in rgb_arrays]
-        logger.debug(f"split rgb array list has elements {split_rgb_arrays[0]}")
+
+        # split arrays are lists of arrays, these lists should be added together into one big list...
+
+        split_rgb_arrays = reduce(lambda a,b:a+b, split_rgb_arrays)
 
         # DONT STACK because that is done later with tf.data.Dataset.batch()
         # logger.info("stack each list of subimages along new first dimension")
@@ -280,42 +307,52 @@ if __name__ == '__main__':
         logger.info("perform inference on a single batch")
         for (images,) in tf_dataset.batch(BATCH_SIZE*15):
             logger.debug(f"tf_predictor(images) where images is type {type(images)} with shape {images.shape} ")
-            prediction = tf_predictor(images)    
+            prediction = tf_predictor(images)
+            prediction = prediction['sigmoid']    
 
-        logger.debug(prediction.__dict__)
+        logger.info(f"prediction success: type = {type(prediction)} with shape {prediction.shape}")
+        # logger.debug(f"prediction = {prediction}")
 
-        logger.info("unsplit the arrays")
         # nested list comprehension takes 15 inference arrays and makes them back into one image
-        inferred_ship_tracks = [combine_masks(p['sigmoid']) for p in [prediction[j*15:(j+1)*15] for j in range(len(prediction//15))]]
-        inferred_ship_tracks = [resize_arr(x, ds.shape) for (x,ds) in zip(inferred_ship_tracks, dataarrays)]
+        # FIXME @anla : this pattern is ugly and obscure.
+        inferred_ship_tracks = [combine_masks(p) for p in [prediction[j*15:(j+1)*15] for j in range(len(prediction)//15)]]
+
+        # reshape back to the dataarray shape,
+        # except the bands dimension has been removed hence .shape[:2]
+        inferred_ship_tracks = [resize_arr(x, ds.shape[:2]) for (x,ds) in zip(inferred_ship_tracks, dataarrays)]
 
         logger.info("create new variable in all dataset")
         out_datasets = []
         for (x, ds) in zip(inferred_ship_tracks, datasets):
             ds['ship_tracks'] = xr.Variable(
-                dims=['y','x'],
+                dims=['x','y'],
                 data=x,
                 # FIXME @anla : this gets overwritten when contour to geometry
                 attrs={'description':'inferred ship track array'},
             )
 
-            out_datasets.append(ds['ship_tracks'])
+            out_datasets.append(ds[['ship_tracks']])
+        
+
+        logger.info("creating output file base names")
+        logger.info(f"outdir = {args.outdir}")
+        logger.debug(f"out_names = {outnames}")
+        logger.info(f"number of files to write = {len(out_datasets)}")
 
         # write to desired output format
         if 'netcdf' in args.format:
-            logger.info(f'writing to netcdf {out_name + ".nc"}')
-            for ds in datasets:
-                ds[
-                    ['ship_tracks']
-                ].to_netcdf(
+            logger.info(f'writing to netcdfs')
+            for (ds, out_name) in zip(out_datasets, outnames):
+                logger.debug(f"writitng {ds} to files {out_name+'.c'}")
+                ds.to_netcdf(
                     out_name + '.nc',
                     encoding={'ship_tracks':{'zlib':True,'complevel':4}}
                 )
 
         if 'geopackage' in args.format:
-            logger.info("computing shapes")
+            logger.info("writing to geopackages")
 
-            for ds in datasets:
+            for (ds, out_name) in zip(out_datasets, outnames):
                 gdf = xr_vectoriser(ds['ship_tracks'], level=args.contour_level)
 
                 # assign attributes from data array to GeoDataFrame
@@ -330,7 +367,7 @@ if __name__ == '__main__':
                 gdf['description'] = f"multipolygon describing contour at level {args.contour_level} of infered ship track probability"
                             
                 # write to geopackage
-                logger.info(f'writing to geopackage {out_name + ".gpkg"}')
+                logger.debug(f'writing to geopackage {out_name + ".gpkg"}')
                 gdf.to_file(
                     out_name + '.gpkg',
                     driver='GPKG',
