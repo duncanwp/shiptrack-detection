@@ -255,12 +255,14 @@ if __name__ == '__main__':
         rgb_arrays = [resize_arr((x*255).astype(np.uint8), INT_IMG_SIZE[::-1]) for x in rgb_arrays]
 
         logger.info("split into expected image shape")
-        split_rgb_arrays = [split_array(x, IMG_SIZE) for x in rgb_arrays]
+        # recast to float32 between 0 and 1, loss of resolutoin
+        split_rgb_arrays = [split_array((x/255.).astype(np.float32), IMG_SIZE) for x in rgb_arrays]
         logger.debug(f"split rgb array list has elements {split_rgb_arrays[0]}")
 
-        logger.info("stack each list of subimages along new first dimension")
-        split_rgb_arrays = [np.stack(x) for x in split_rgb_arrays]
-        logger.debug(f"split rgb array list has elements {split_rgb_arrays[0]}")
+        # DONT STACK because that is done later with tf.data.Dataset.batch()
+        # logger.info("stack each list of subimages along new first dimension")
+        # split_rgb_arrays = [np.stack(x) for x in split_rgb_arrays]
+        # logger.debug(f"split rgb array list has elements {split_rgb_arrays[0]}")
 
         logger.info("convert into list of tf.Tensors ??")
         split_rgb_tensors = [tf.convert_to_tensor(x) for x in split_rgb_arrays]
@@ -274,16 +276,17 @@ if __name__ == '__main__':
         # use dataset methods?...
         # tf_dataset.batch().map()
 
-        # FIXME @anla : something is wrong, adding debug
+        # granules are split into 15 sub-images, therefore batchsize is 15x BATCHSIZE
         logger.info("perform inference on a single batch")
-        for (images,) in tf_dataset.batch(BATCH_SIZE):
+        for (images,) in tf_dataset.batch(BATCH_SIZE*15):
             logger.debug(f"tf_predictor(images) where images is type {type(images)} with shape {images.shape} ")
             prediction = tf_predictor(images)    
 
         logger.debug(prediction.__dict__)
 
         logger.info("unsplit the arrays")
-        inferred_ship_tracks = [combine_masks(p['sigmoid']) for p in prediction]
+        # nested list comprehension takes 15 inference arrays and makes them back into one image
+        inferred_ship_tracks = [combine_masks(p['sigmoid']) for p in [prediction[j*15:(j+1)*15] for j in range(len(prediction//15))]]
         inferred_ship_tracks = [resize_arr(x, ds.shape) for (x,ds) in zip(inferred_ship_tracks, dataarrays)]
 
         logger.info("create new variable in all dataset")
