@@ -246,7 +246,7 @@ if __name__ == '__main__':
     file_batches = [infiles[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(len(infiles)//BATCH_SIZE + (len(infiles) % BATCH_SIZE > 0))]
 
     # dumb batching with no prefetching
-    for file_batch in file_batches:
+    for file_batch in tqdm(file_batches):
         
         logger.info(f"processing {len(file_batch)} files")
         
@@ -266,7 +266,7 @@ if __name__ == '__main__':
         datasets = [xr.open_dataset(file) for file in file_batch]
 
         # tranpose to put bands last
-        datasets = [x.transpose(...,'bands') for x in datasets]
+        datasets = [x.transpose('y','x','bands') for x in datasets]
 
         logger.info("contrast stretching")
         dataarrays = [stretch_dataarray(x['day_microphysics'], stretch=args.stretch) for x in datasets]
@@ -276,7 +276,7 @@ if __name__ == '__main__':
 
         logger.info("resize the rgb_arrays")
         # PIL will not accept floating point, only ints betwee 0 and 255
-        rgb_arrays = [resize_arr((x*255).astype(np.uint8), INT_IMG_SIZE[::-1]) for x in rgb_arrays]
+        rgb_arrays = [resize_arr((x*255).astype(np.uint8), INT_IMG_SIZE) for x in rgb_arrays]
 
         logger.info("split into expected image shape")
         # recast to float32 between 0 and 1, loss of resolution
@@ -319,13 +319,13 @@ if __name__ == '__main__':
 
         # reshape back to the dataarray shape,
         # except the bands dimension has been removed hence .shape[:2]
-        inferred_ship_tracks = [resize_arr(x, ds.shape[:2]) for (x,ds) in zip(inferred_ship_tracks, dataarrays)]
+        inferred_ship_tracks = [resize_arr(x, (ds['y'].size, ds['x'].size)) for (x,ds) in zip(inferred_ship_tracks, dataarrays)]
 
         logger.info("create new variable in all dataset")
         out_datasets = []
         for (x, ds) in zip(inferred_ship_tracks, datasets):
             ds['ship_tracks'] = xr.Variable(
-                dims=['x','y'],
+                dims=('y','x'),
                 data=x,
                 # FIXME @anla : this gets overwritten when contour to geometry
                 attrs={'description':'inferred ship track array'},
