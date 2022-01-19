@@ -5,9 +5,9 @@ from pathlib import Path
 
 import tensorflow as tf
 
-from keras import backend as K
-from keras.callbacks import TensorBoard, ReduceLROnPlateau
-from keras.optimizers import Adam
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import TensorBoard, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
 
 # c.f. https://github.com/qubvel/segmentation_models/issues/374
 import os
