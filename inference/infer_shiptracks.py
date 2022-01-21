@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 """
+Using factor pattern to create tensorflow Dataset object
+
 Simplified script that run inference for NEODAAS request 21_02
 that only accepts netcdf input files and returns either netcdf of gpkg
 
@@ -99,42 +101,73 @@ def get_image(file):
     return im_data
 
 
-def resize_arr(arr, target_size, bilinear=True):
-    from PIL import Image
+def stitch_up(X):
+    # nested concat split calls to
+    # stitch back together a image
+    # from a 5 x 3 grid of sub-images
+    return tf.concat(
+            tf.split(
+                tf.concat(
+                    tf.split(
+                        X,
+                        3,
+                        axis=0
+                    ),
+                    axis=2
+                ),
+                5,
+                axis=0
+            ),
+            axis=1
+        )
+
+def cut_squares(X):
+    # nested split concat calls
+    # to break image into 5 x 3 grid
+    # of 448 * 448 sub-images
+    return tf.concat(
+        tf.split(
+            tf.concat(
+                tf.split(
+                    X,
+                    5,
+                    axis=1
+                ),
+                axis=0
+            ),
+            3,
+            axis=2
+        ),
+        axis=0
+    )
+
+
+
+def rgb_netcdf_to_tensor(ncfile) -> tf.Tensor:
+    # load netcdf as xr.dataarray and convert to tf.Tensor
+    # transpose RGB channels to last dimension and downcast
+    # to float32. Tensorflow expects this I think
     
-    # @anla : I don't like this hidden behaviour
-    resampler = Image.BILINEAR if bilinear else Image.NEAREST
-    
-    arr_im = Image.fromarray(arr) 
+    ds = xr.load_dataarray(ncfile)
+    ds = ds.transpose(...,'bands').astype('float32')
 
-    arr_im = arr_im.resize(target_size, resample=resampler)
-    
-    new_arr = np.array(arr_im)
-    return new_arr
+    return tf.convert_to_tensor(ds)
 
+def ncfiles_to_dataset(ncfiles) -> tf.data.Dataset:
+    # given list of netcdf files, return a tf Dataset
 
-def combine_masks(masks):
+    # this syntax returns a callable that itself returns iterable
+    # necessary for use with tensorflow's from_generator function
+    gen = lambda: (rgb_netcdf_to_tensor(x) for x in ncfiles)
 
-    nested_masks = [np.split(m, 3) for m in np.split(masks[..., 0], 5, 0)]
-    mask = np.squeeze(np.block(nested_masks))
+    return tf.data.Dataset.from_generator(gen, output_types='float')
 
-    return mask
+def resize_image(X:tf.Tensor) -> tf.Tensor:
+    return tf.image.resize(
+        images = X,
+        size = IMAGE_SHAPE
+    )
 
-def get_ship_track_array(rgb_array, tf_predictor):
-
-    # reshape and split array prior to inference
-    original_size = rgb_array.shape[1::-1] # The size is the inverse of the shape (minus the color channel)
-    reshaped_rgb_array = resize_arr(rgb_array, INT_IMG_SIZE[::-1])
-    split_rgb_array = split_array(reshaped_rgb_array, IMG_SIZE)
-
-    # call model for inference
-    prediction = tf_predictor(data=tf.constant(split_rgb_array, dtype='float32'))
-
-    # stitch and resize output back to original size
-    inferred_ship_tracks = combine_masks(prediction['sigmoid'])
-    inferred_ship_tracks = resize_arr(inferred_ship_tracks, original_size)
-    
-    return inferred_ship_tracks
 
 def stretch_dataarray(x:xr.DataArray, stretch='histogram') -> xr.DataArray:
     '''perform a trollimage stretch operation with given method
@@ -241,6 +274,39 @@ if __name__ == '__main__':
         infiles = [x.replace("\n","") for x in args.infile.readlines()]
     else:
         infiles = args.infiles
+
+    # # # tf dataset creation # # #
+    tfds = ncfiles_to_dataset(infiles)
+
+    # padded batch dataset for handling different shapes
+    tfds = tfds.padded_batch(
+            BATCH_SIZE,
+            padded_shapes=(2040,1354,3),
+            padding_values=0.0,
+            drop_remainder=True
+        )
+
+    # resize image
+    tfds = tfds.map(resize_image)
+
+    # cut squares and stack
+    tfds = tfds.map(cut_squares)
+
+    # perform inference
+    for (images,), in tfds:
+        predicitons = tf_predictor(images)['sigmoid']
+
+        tf.split(predictions, BATCH_SIZE axis=0)
+
+    
+
+
+
+
+
+
+
+
 
     # main loop through input files...
     file_batches = [infiles[i*BATCH_SIZE:(i+1)*BATCH_SIZE] for i in range(len(infiles)//BATCH_SIZE + (len(infiles) % BATCH_SIZE > 0))]
