@@ -1,92 +1,55 @@
-#---------------------------------------------------------------
-# TOP LEVEL CODE
-#---------------------------------------------------------------
-# PROCESS_TRACK_IMAGES
-#
-# Description
-# General program to read MODIS reflectance and shiptrack hand-logged
-# files with some basic plots to illustrate where ship tracks are located
-# in the satellite granule. Uses PyTroll to plot/read the MODIS image.
-#
-# Notes: this code currently crops 250 pixels off the edge of each
-#        image. Ship tracks are logged based on the lower left corner
-#        starting at x=0 and y=0. The ML algorithm requires the top-left
-#        corner to start at x=0 and y=0 therefore we tranform the y-coord
-#        for bounding box locations.
-#
-# Output
-# 1) Plots of NIR composite images for each MODIS granule
-#       path ---> /images
-# 2) Plots of the bounding boxes (used as a sanity check)
-#       path ---> /images_bbox/
-# 3) Text File: contains the bounding boxes according to DIGITS
-#       path --> /labels/
-#    (FORMAT: see 
-#    https://github.com/NVIDIA/DIGITS/blob/master/digits/extensions/data/objectDetection/README.md)
-#
-# Example
-# python2.7 -i process_track_images.py
-#
-# History
-# 11/12/18, MC: upload initial version of the code to the repo
-#---------------------------------------------------------------
-
-#---------------------------------------------------------------
-# Libraries
-#---------------------------------------------------------------
-from subroutines_track_images import *
 import datetime
 import numpy as np
 import os,sys,glob
-from netCDF4 import Dataset
 from multiprocessing import Pool, Value
 
 import pandas as pd
 
-
-#---------------------------------------------------------------
-# Paths
-#---------------------------------------------------------------
-#Ship Track Hand-logged Files
-
 path_track_root = '/gws/nopw/j04/aopp/mchristensen/shiptrack/shiptrack_logged_files/combined_v2/'
 
-#---------------------------------------------------------------
-# Fetch Ship Track Files
-#---------------------------------------------------------------
-trackfiles = file_search_tracks( path_track_root )
-tfiles = trackfiles['tfiles']
-lfiles = trackfiles['lfiles']
-fct = len(tfiles)
+def file_search_tracks(path):
+    """
+    Specific file search routine to output matching t & l track stat files. 
+    There must be a neater way to do this...
+    """
+    tfiles = file_search( path, '.dat', 't')
+    lfiles = file_search( path, '.dat', 'l')
 
-CT = None
+    nfiles=0
+    if len(tfiles) <= len(lfiles):
+        nfiles = len(tfiles)
+        file_set = tfiles
+    if len(lfiles) < len(tfiles):
+        nfiles = len(lfiles)
+        file_set = lfiles
 
-def init(args):
-    """ Store the counter ready for later use """
-    global CT
-    CT = args
+    #Find where they match
+    mergedLfiles = []
+    mergedTfiles = []
+    for i in range(nfiles):
+        fileInfo = os.path.split(file_set[i])
+        tmpfilepath = fileInfo[0]
+        tmpfile = fileInfo[1]
+        ed=len(tmpfile)
+        Tindex=((np.where(np.array(tfiles) == tmpfilepath+'/t'+tmpfile[1:ed]))[0])[0]
+        Lindex=((np.where(np.array(lfiles) == tmpfilepath+'/l'+tmpfile[1:ed]))[0])[0]
+        tmpLfile = lfiles[Lindex]
+        tmpTfile = tfiles[Tindex]
+        mergedLfiles.append(tmpLfile)
+        mergedTfiles.append(tmpTfile)
+
+    return mergedTfiles, mergedLfiles
 
 
-def main(i):
-    global CT
+def convert_to_df(tfilename, lfilename):
+    """
+    Read in a set of tile and map track coordinates and return a single nice dataframe
+    """
 
-    # Read track lat/lon locations
-    fileInfo = os.path.split(lfiles[i])
-    lfilename = fileInfo[0]+'/'+fileInfo[1]
-    track_geo = read_osu_shiptrack_file(lfilename)
-
-    # Read track locations from file
-    fileInfo = os.path.split(tfiles[i])
-    tfilepath = fileInfo[0]
-    tfile = fileInfo[1]
-    tfilename = tfilepath+'/'+tfile
-    track_points = read_osu_shiptrack_file(tfilename)
+    tfile = os.path.basename(tfilename)
 
     # Get the track source
     tSource = tfile[1:4]
-
-    print(tfilename)
-    print(tSource)
 
     # Fetch corresponding MODIS granule
     mtype=''
@@ -126,12 +89,14 @@ def main(i):
 
 
 
+tfiles, lfiles = trackfiles = file_search_tracks(path_track_root)
 
-p=Pool(initializer=init, initargs=(Value('i', 0),), processes=4)
+
+p=Pool(processes=4)
 # Loop over each track file
-tracks = p.map(main, range(fct))
+tracks = p.starmap(convert_to_df, (tfiles, lfiles))
 
 df = pd.concat(tracks)
 print(df)
-df.to_csv('combined_v2.csv')
+df.to_csv('combined.csv')
 
