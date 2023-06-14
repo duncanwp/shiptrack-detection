@@ -20,6 +20,10 @@ from functools import partial
 
 satpy.config.set(config_path=['/home/users/dwatsonparris/satpy_config'])
 
+# import xarrray as xr
+# # Read the pre-computed quantiles
+# quantiles = xr.open_dataarray('20180716_daily_quantiles.nc')
+
 
 def main(track_file, output_path, experiment_name, modis_path, overwrite=False, n_processes=1, tar_output=False):
     # Create output directories
@@ -96,7 +100,11 @@ def process_dt(dt, image_tracks, modis_path, overwrite, path_output_images, path
             composite = 'day_microphysics' if daytime else 'night_microphysics'
             global_scene.load([composite], resolution=1000)  # This uses channels 1, 20 and 31)
             img = to_image(global_scene[composite])
-            img.stretch("histogram")
+            # img.stretch("crude", min_stretch=quantiles.sel(quantile=0.05), max_stretch=quantiles.sel(quantile=0.95))
+            img.crude_stretch(min_stretch=[2.044909, 1.795136, 236.558919], 
+                              max_stretch=[78.810258, 22.026770, 300.755732])
+            # img.crude_stretch(1, min_stretch=, max_stretch=22.026770)
+            # img.crude_stretch(2, min_stretch=, max_stretch=300.755732)
             img.save(image_file)
 
         # Create points file
